@@ -12,7 +12,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Alpaca
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import AssetStatus
 from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
@@ -129,15 +128,36 @@ def ensure_worksheet(sh, title: str, rows: int = 100, cols: int = 50) -> gspread
 # Data Fetching
 # -------------------------
 def list_alpaca_tradable_assets() -> List[Dict]:
-    assets = trading_client.get_all_assets(status=AssetStatus.ACTIVE)
-    tradable_assets = []
+    """
+    Robust to alpaca-py versions: call get_all_assets() with no kwargs,
+    then filter by .tradable and status == 'active' if available.
+    """
+    # Some versions of alpaca-py don't accept keyword args here.
+    assets = trading_client.get_all_assets()
+
+    tradable_assets: List[Dict] = []
     for a in assets:
-        if not a.tradable:
+        # defensive attribute access across versions
+        tradable = getattr(a, "tradable", False)
+        status = getattr(a, "status", None)
+        asset_class_obj = getattr(a, "asset_class", None)
+        symbol = getattr(a, "symbol", None)
+
+        if not symbol:
             continue
-        tradable_assets.append({
-            "symbol": a.symbol,
-            "class": a.asset_class.value if hasattr(a.asset_class, 'value') else str(a.asset_class),
-        })
+        if not tradable:
+            continue
+        if status is not None and str(status).lower() != "active":
+            continue
+
+        # asset_class may be an enum or string; normalize to string
+        if hasattr(asset_class_obj, "value"):
+            cls = asset_class_obj.value
+        else:
+            cls = str(asset_class_obj) if asset_class_obj is not None else ""
+
+        tradable_assets.append({"symbol": symbol, "class": cls})
+
     # Deduplicate symbols defensively
     seen = set()
     unique = []
