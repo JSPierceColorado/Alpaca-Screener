@@ -1,0 +1,10 @@
+alpaca-py==0.26.0
+pandas==2.2.3
+numpy==2.1.2
+gspread==6.1.2
+google-auth==2.35.0
+python-dotenv==1.0.1
+pytz==2024.2
+krakenex==2.1.0
+requests==2.32.3
+tenacity==9.0.0
