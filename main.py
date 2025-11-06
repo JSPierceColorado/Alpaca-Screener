@@ -16,6 +16,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed  # <-- feed enum
 
 # Google Sheets
 import gspread
@@ -28,6 +29,7 @@ APCA_API_KEY_ID = os.environ.get("APCA_API_KEY_ID")
 APCA_API_SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 APCA_API_BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 APCA_DATA_BASE_URL = os.environ.get("APCA_DATA_BASE_URL", "https://data.alpaca.markets")
+APCA_DATA_FEED = (os.environ.get("APCA_DATA_FEED", "iex").lower())  # iex or sip
 
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Trading Log")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
@@ -36,16 +38,13 @@ REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 50))
 SLEEP_BETWEEN_BATCHES = int(os.environ.get("SLEEP_BETWEEN_BATCHES", 5))
 
-# If True, we'll still compute daily PL%/ATH when 15m bars are missing, but leave intraday metrics/sparkline blank.
-ALLOW_DAILY_FALLBACK = (os.environ.get("ALLOW_DAILY_FALLBACK", "false").lower() == "true")
+# Require at least this many 15m bars to keep a symbol
+MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 20))
 
 TZ = pytz.UTC
 
 SCREENER_TAB = "Alpaca-Screener"
 CHARTDATA_TAB = "Alpaca-Screener-chartData"
-
-# Require at least this many 15m bars to keep a symbol (prevents spurious very-new/no-data tickers)
-MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 20))
 
 # -------------------------
 # Utilities
@@ -106,12 +105,14 @@ def ensure_worksheet(sh, title: str, rows: int = 100, cols: int = 50) -> gspread
         return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
 # -------------------------
-# Assets list (REST; equities only, no crypto/perps/options)
+# Assets list (REST; equities only on primary exchanges)
 # -------------------------
+ALLOWED_EXCHANGES = {"NYSE","NASDAQ","ARCA","BATS","NYSEARCA"}
+
 def list_alpaca_tradable_equities() -> List[Dict]:
     """
     Fetch assets via REST to avoid SDK enum issues.
-    Include only active + tradable + class == 'us_equity'.
+    Keep only: active + tradable + class == 'us_equity' + exchange in ALLOWED_EXCHANGES.
     """
     url = APCA_API_BASE_URL.rstrip('/') + "/v2/assets"
     headers = {
@@ -136,9 +137,16 @@ def list_alpaca_tradable_equities() -> List[Dict]:
             continue
         if not a.get("tradable", False):
             continue
+
         cls = (a.get("class") or a.get("asset_class") or "").lower()
         if cls != "us_equity":
             continue
+
+        exch = (a.get("exchange") or "").upper()
+        if exch not in ALLOWED_EXCHANGES:
+            # Cut out OTC and other venues that often lack IEX intraday coverage
+            continue
+
         out.append({"symbol": symbol})
 
     # Deduplicate
@@ -162,21 +170,28 @@ class TransientDataError(Exception):
     retry=retry_if_exception_type(TransientDataError)
 )
 def fetch_stock_bars(symbols: List[str], start: datetime, end: datetime, tf: TimeFrame):
+    # Choose data feed based on env; default IEX (free plan)
+    feed = DataFeed.IEX if APCA_DATA_FEED == "iex" else DataFeed.SIP
     try:
-        req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=tf, start=start, end=end)
+        req = StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=tf,
+            start=start,
+            end=end,
+            feed=feed
+        )
         df = stock_data_client.get_stock_bars(req).df
         return df
     except Exception as e:
         msg = str(e).lower()
-        # Treat rate limits/timeouts as transient to trigger retry; treat 4xx like 404/422 as permanent.
         transient_markers = ["timeout", "temporarily", "rate limit", "429", "too many requests", "connection reset", "502", "503", "504"]
-        permanent_markers = ["404", "422", "unavailable for symbol", "invalid symbol"]
+        permanent_markers = ["403", "forbidden", "plan", "not entitled", "unauthorized", "404", "422", "unavailable for symbol", "invalid symbol"]
         if any(m in msg for m in permanent_markers):
-            # No retry, propagate as non-transient
+            # don't waste retries on plan/permission/invalid symbol issues
             raise
         if any(m in msg for m in transient_markers):
             raise TransientDataError(msg)
-        # Default: retry once (conservative)
+        # default conservative retry
         raise TransientDataError(msg)
 
 # -------------------------
@@ -187,7 +202,7 @@ def compute_metrics_for_symbol(symbol: str) -> Tuple[Dict, pd.Series]:
     two_weeks_ago = now - timedelta(days=14)
     five_years_ago = now - timedelta(days=365*5)
 
-    # ---- 15-min bars (2 weeks) for indicators + sparkline ----
+    # 15-min bars (2 weeks) for indicators + sparkline
     tf_15 = TimeFrame(15, TimeFrameUnit.Minute)
     df_15 = None
     try:
@@ -197,22 +212,30 @@ def compute_metrics_for_symbol(symbol: str) -> Tuple[Dict, pd.Series]:
     except Exception as e:
         print(f"[WARN] 15m bars fetch failed for {symbol}: {e}")
 
-    # If no/too-few 15m bars, either skip entirely or allow daily-only fallback
     if df_15 is None or df_15.empty or len(df_15) < MIN_15M_BARS:
-        if not ALLOW_DAILY_FALLBACK:
-            # Skip this symbol to keep charting consistent
-            return None, None
-        else:
-            df_15 = None  # mark as missing; we'll fill intraday fields as empty
+        return None, None
 
-    closes_15 = None
-    volumes_15 = None
-    if df_15 is not None:
-        df_15 = df_15.sort_index()
-        closes_15 = df_15['close']
-        volumes_15 = df_15['volume'] if 'volume' in df_15.columns else pd.Series(index=df_15.index, data=np.nan)
+    df_15 = df_15.sort_index()
+    closes_15 = df_15['close']
+    volumes_15 = df_15['volume'] if 'volume' in df_15.columns else pd.Series(index=df_15.index, data=np.nan)
 
-    # ---- Daily bars for P/L % and ATH (5y window) ----
+    # Indicators
+    rsi14_series = rsi(closes_15, 14)
+    ma60 = closes_15.rolling(window=60, min_periods=1).mean()
+    ma240 = closes_15.rolling(window=240, min_periods=1).mean()
+    macd_line, signal_line = macd(closes_15)
+
+    rsi14 = float(rsi14_series.iloc[-1]) if len(rsi14_series) else np.nan
+    ma60_last = float(ma60.iloc[-1]) if len(ma60) else np.nan
+    ma240_last = float(ma240.iloc[-1]) if len(ma240) else np.nan
+    macd_last = float(macd_line.iloc[-1]) if len(macd_line) else np.nan
+    macd_signal_last = float(signal_line.iloc[-1]) if len(signal_line) else np.nan
+
+    # Rolling “24h” volume from last 96 15-min bars
+    recent_96 = volumes_15.tail(96)
+    vol_24h = float(recent_96.sum(skipna=True)) if len(recent_96) else np.nan
+
+    # Daily bars for P/L % and ATH
     tf_1d = TimeFrame.Day
     try:
         df_1d = fetch_stock_bars([symbol], five_years_ago, now, tf_1d)
@@ -246,29 +269,7 @@ def compute_metrics_for_symbol(symbol: str) -> Tuple[Dict, pd.Series]:
         if ath > 0:
             pct_down_ath = float(((last_close - ath) / ath) * 100.0)
 
-    # ---- Intraday indicators (only if we have 15m data) ----
-    if df_15 is not None:
-        rsi14_series = rsi(closes_15, 14)
-        ma60 = closes_15.rolling(window=60, min_periods=1).mean()
-        ma240 = closes_15.rolling(window=240, min_periods=1).mean()
-        macd_line, signal_line = macd(closes_15)
-
-        rsi14 = float(rsi14_series.iloc[-1]) if len(rsi14_series) else np.nan
-        ma60_last = float(ma60.iloc[-1]) if len(ma60) else np.nan
-        ma240_last = float(ma240.iloc[-1]) if len(ma240) else np.nan
-        macd_last = float(macd_line.iloc[-1]) if len(macd_line) else np.nan
-        macd_signal_last = float(signal_line.iloc[-1]) if len(signal_line) else np.nan
-
-        # Rolling “24h” volume from the last 96 15-min bars (note: equities)
-        recent_96 = volumes_15.tail(96)
-        vol_24h = float(recent_96.sum(skipna=True)) if len(recent_96) else np.nan
-
-        spark_series = closes_15.tail(14 * 24 * 4)
-    else:
-        # Fallback: leave intraday fields blank, no sparkline
-        rsi14 = ma60_last = ma240_last = macd_last = macd_signal_last = np.nan
-        vol_24h = np.nan
-        spark_series = pd.Series(dtype=float)
+    spark_series = closes_15.tail(14 * 24 * 4)
 
     row = {
         "symbol": symbol,
@@ -345,12 +346,11 @@ def run_once():
     ws_chart = ensure_worksheet(sh, CHARTDATA_TAB, rows=2000, cols=500)
 
     assets = list_alpaca_tradable_equities()
-    print(f"Found {len(assets)} Alpaca tradable US equities")
+    print(f"Found {len(assets)} Alpaca tradable US equities on primary exchanges")
 
     rows: List[Dict] = []
     spark_map: Dict[str, pd.Series] = {}
 
-    skipped_no_intraday = 0
     for i in range(0, len(assets), BATCH_SIZE):
         batch = assets[i:i+BATCH_SIZE]
         print(f"Processing batch {i//BATCH_SIZE + 1} containing {len(batch)} assets ...")
@@ -364,21 +364,14 @@ def run_once():
             if row is not None and spark is not None and len(spark) > 0:
                 rows.append(row)
                 spark_map[sym] = spark
-            elif row is not None and ALLOW_DAILY_FALLBACK:
-                rows.append(row)  # keep daily-only metrics
-                spark_map[sym] = pd.Series(dtype=float)
-                skipped_no_intraday += 1
         time.sleep(SLEEP_BETWEEN_BATCHES)
-
-    if not ALLOW_DAILY_FALLBACK:
-        print(f"Skipped symbols with missing/insufficient 15m bars: {skipped_no_intraday}")
 
     rows.sort(key=lambda r: r.get('symbol', ''))
     write_chartdata(ws_chart, spark_map)
     write_screener(ws_main, rows)
 
 if __name__ == "__main__":
-    print("Starting Alpaca ➜ Google Sheets screener loop (US equities only)…")
+    print("Starting Alpaca ➜ Google Sheets screener loop (US equities, IEX feed)…")
     refresh_seconds = max(60, REFRESH_MINUTES * 60)
     while True:
         try:
