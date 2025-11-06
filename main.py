@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytz
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Alpaca
 from alpaca.trading.client import TradingClient
@@ -36,10 +36,16 @@ REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 50))
 SLEEP_BETWEEN_BATCHES = int(os.environ.get("SLEEP_BETWEEN_BATCHES", 5))
 
+# If True, we'll still compute daily PL%/ATH when 15m bars are missing, but leave intraday metrics/sparkline blank.
+ALLOW_DAILY_FALLBACK = (os.environ.get("ALLOW_DAILY_FALLBACK", "false").lower() == "true")
+
 TZ = pytz.UTC
 
 SCREENER_TAB = "Alpaca-Screener"
 CHARTDATA_TAB = "Alpaca-Screener-chartData"
+
+# Require at least this many 15m bars to keep a symbol (prevents spurious very-new/no-data tickers)
+MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 20))
 
 # -------------------------
 # Utilities
@@ -130,12 +136,9 @@ def list_alpaca_tradable_equities() -> List[Dict]:
             continue
         if not a.get("tradable", False):
             continue
-
         cls = (a.get("class") or a.get("asset_class") or "").lower()
         if cls != "us_equity":
-            # explicitly exclude crypto, perps, options, etc.
             continue
-
         out.append({"symbol": symbol})
 
     # Deduplicate
@@ -150,10 +153,31 @@ def list_alpaca_tradable_equities() -> List[Dict]:
 # -------------------------
 # Data fetching
 # -------------------------
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=1, max=30))
+class TransientDataError(Exception):
+    pass
+
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    retry=retry_if_exception_type(TransientDataError)
+)
 def fetch_stock_bars(symbols: List[str], start: datetime, end: datetime, tf: TimeFrame):
-    req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=tf, start=start, end=end)
-    return stock_data_client.get_stock_bars(req).df
+    try:
+        req = StockBarsRequest(symbol_or_symbols=symbols, timeframe=tf, start=start, end=end)
+        df = stock_data_client.get_stock_bars(req).df
+        return df
+    except Exception as e:
+        msg = str(e).lower()
+        # Treat rate limits/timeouts as transient to trigger retry; treat 4xx like 404/422 as permanent.
+        transient_markers = ["timeout", "temporarily", "rate limit", "429", "too many requests", "connection reset", "502", "503", "504"]
+        permanent_markers = ["404", "422", "unavailable for symbol", "invalid symbol"]
+        if any(m in msg for m in permanent_markers):
+            # No retry, propagate as non-transient
+            raise
+        if any(m in msg for m in transient_markers):
+            raise TransientDataError(msg)
+        # Default: retry once (conservative)
+        raise TransientDataError(msg)
 
 # -------------------------
 # Computations per symbol (equities only)
@@ -163,50 +187,39 @@ def compute_metrics_for_symbol(symbol: str) -> Tuple[Dict, pd.Series]:
     two_weeks_ago = now - timedelta(days=14)
     five_years_ago = now - timedelta(days=365*5)
 
-    # 15-min bars (2 weeks) for indicators + sparkline
+    # ---- 15-min bars (2 weeks) for indicators + sparkline ----
     tf_15 = TimeFrame(15, TimeFrameUnit.Minute)
+    df_15 = None
     try:
         df_15 = fetch_stock_bars([symbol], two_weeks_ago, now, tf_15)
+        if df_15 is not None and not df_15.empty and isinstance(df_15.index, pd.MultiIndex):
+            df_15 = df_15.xs(symbol, level='symbol')
     except Exception as e:
         print(f"[WARN] 15m bars fetch failed for {symbol}: {e}")
-        return None, None
 
-    if df_15 is None or df_15.empty:
-        return None, None
-
-    if isinstance(df_15.index, pd.MultiIndex):
-        try:
-            df_15 = df_15.xs(symbol, level='symbol')
-        except KeyError:
+    # If no/too-few 15m bars, either skip entirely or allow daily-only fallback
+    if df_15 is None or df_15.empty or len(df_15) < MIN_15M_BARS:
+        if not ALLOW_DAILY_FALLBACK:
+            # Skip this symbol to keep charting consistent
             return None, None
+        else:
+            df_15 = None  # mark as missing; we'll fill intraday fields as empty
 
-    df_15 = df_15.sort_index()
+    closes_15 = None
+    volumes_15 = None
+    if df_15 is not None:
+        df_15 = df_15.sort_index()
+        closes_15 = df_15['close']
+        volumes_15 = df_15['volume'] if 'volume' in df_15.columns else pd.Series(index=df_15.index, data=np.nan)
 
-    closes_15 = df_15['close']
-    volumes_15 = df_15['volume'] if 'volume' in df_15.columns else pd.Series(index=df_15.index, data=np.nan)
-
-    # Indicators on 15-min closes
-    rsi14_series = rsi(closes_15, 14)
-    ma60 = closes_15.rolling(window=60, min_periods=1).mean()
-    ma240 = closes_15.rolling(window=240, min_periods=1).mean()
-    macd_line, signal_line = macd(closes_15)
-
-    rsi14 = float(rsi14_series.iloc[-1]) if len(rsi14_series) else np.nan
-    ma60_last = float(ma60.iloc[-1]) if len(ma60) else np.nan
-    ma240_last = float(ma240.iloc[-1]) if len(ma240) else np.nan
-    macd_last = float(macd_line.iloc[-1]) if len(macd_line) else np.nan
-    macd_signal_last = float(signal_line.iloc[-1]) if len(signal_line) else np.nan
-
-    # Rolling “24h” volume from the last 96×15m bars (equities: reflects recent activity)
-    recent_96 = volumes_15.tail(96)
-    vol_24h = float(recent_96.sum(skipna=True)) if len(recent_96) else np.nan
-
-    # Daily bars for P/L % and ATH (fetch 5y to approximate ATH)
+    # ---- Daily bars for P/L % and ATH (5y window) ----
     tf_1d = TimeFrame.Day
     try:
         df_1d = fetch_stock_bars([symbol], five_years_ago, now, tf_1d)
-        if isinstance(df_1d.index, pd.MultiIndex):
+        if df_1d is not None and not df_1d.empty and isinstance(df_1d.index, pd.MultiIndex):
             df_1d = df_1d.xs(symbol, level='symbol')
+        if df_1d is None:
+            df_1d = pd.DataFrame()
         df_1d = df_1d.sort_index()
     except Exception as e:
         print(f"[WARN] 1D bars fetch failed for {symbol}: {e}")
@@ -225,16 +238,37 @@ def compute_metrics_for_symbol(symbol: str) -> Tuple[Dict, pd.Series]:
             ref = prior['close'].iloc[-1]
             return float(((last_close - ref) / ref) * 100.0) if ref else np.nan
 
-        pl_1d = pct_change_n_days(1)
-        pl_7d = pct_change_n_days(7)
+        pl_1d  = pct_change_n_days(1)
+        pl_7d  = pct_change_n_days(7)
         pl_14d = pct_change_n_days(14)
 
         ath = float(df_1d['close'].max())
         if ath > 0:
             pct_down_ath = float(((last_close - ath) / ath) * 100.0)
 
-    # Prepare sparkline series (2 weeks of 15m closes)
-    spark_series = closes_15.tail(14 * 24 * 4)
+    # ---- Intraday indicators (only if we have 15m data) ----
+    if df_15 is not None:
+        rsi14_series = rsi(closes_15, 14)
+        ma60 = closes_15.rolling(window=60, min_periods=1).mean()
+        ma240 = closes_15.rolling(window=240, min_periods=1).mean()
+        macd_line, signal_line = macd(closes_15)
+
+        rsi14 = float(rsi14_series.iloc[-1]) if len(rsi14_series) else np.nan
+        ma60_last = float(ma60.iloc[-1]) if len(ma60) else np.nan
+        ma240_last = float(ma240.iloc[-1]) if len(ma240) else np.nan
+        macd_last = float(macd_line.iloc[-1]) if len(macd_line) else np.nan
+        macd_signal_last = float(signal_line.iloc[-1]) if len(signal_line) else np.nan
+
+        # Rolling “24h” volume from the last 96 15-min bars (note: equities)
+        recent_96 = volumes_15.tail(96)
+        vol_24h = float(recent_96.sum(skipna=True)) if len(recent_96) else np.nan
+
+        spark_series = closes_15.tail(14 * 24 * 4)
+    else:
+        # Fallback: leave intraday fields blank, no sparkline
+        rsi14 = ma60_last = ma240_last = macd_last = macd_signal_last = np.nan
+        vol_24h = np.nan
+        spark_series = pd.Series(dtype=float)
 
     row = {
         "symbol": symbol,
@@ -307,8 +341,8 @@ def write_screener(ws_main: gspread.Worksheet, rows: List[Dict]):
 def run_once():
     gc = get_gspread_client()
     sh = open_or_create_sheet(gc)
-    ws_main = ensure_worksheet(sh, SCREENER_TAB, rows=1000, cols=30)
-    ws_chart = ensure_worksheet(sh, CHARTDATA_TAB, rows=1000, cols=500)
+    ws_main = ensure_worksheet(sh, SCREENER_TAB, rows=2000, cols=30)
+    ws_chart = ensure_worksheet(sh, CHARTDATA_TAB, rows=2000, cols=500)
 
     assets = list_alpaca_tradable_equities()
     print(f"Found {len(assets)} Alpaca tradable US equities")
@@ -316,6 +350,7 @@ def run_once():
     rows: List[Dict] = []
     spark_map: Dict[str, pd.Series] = {}
 
+    skipped_no_intraday = 0
     for i in range(0, len(assets), BATCH_SIZE):
         batch = assets[i:i+BATCH_SIZE]
         print(f"Processing batch {i//BATCH_SIZE + 1} containing {len(batch)} assets ...")
@@ -326,10 +361,17 @@ def run_once():
             except Exception as e:
                 print(f"[WARN] compute failed for {sym}: {e}")
                 row, spark = None, None
-            if row is not None:
+            if row is not None and spark is not None and len(spark) > 0:
                 rows.append(row)
                 spark_map[sym] = spark
+            elif row is not None and ALLOW_DAILY_FALLBACK:
+                rows.append(row)  # keep daily-only metrics
+                spark_map[sym] = pd.Series(dtype=float)
+                skipped_no_intraday += 1
         time.sleep(SLEEP_BETWEEN_BATCHES)
+
+    if not ALLOW_DAILY_FALLBACK:
+        print(f"Skipped symbols with missing/insufficient 15m bars: {skipped_no_intraday}")
 
     rows.sort(key=lambda r: r.get('symbol', ''))
     write_chartdata(ws_chart, spark_map)
