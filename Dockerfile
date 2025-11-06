@@ -20,21 +20,29 @@ RUN pip install -r requirements.txt
 # Copy project files
 COPY main.py ./
 
-# Default runtime env vars (override on Railway)
-# Alpaca
+# -----------------------------
+# Environment variable defaults
+# -----------------------------
+
+# Alpaca (override with your real keys in Railway)
 ENV APCA_API_KEY_ID="" \
     APCA_API_SECRET_KEY="" \
     APCA_API_BASE_URL="https://paper-api.alpaca.markets" \
     APCA_DATA_BASE_URL="https://data.alpaca.markets"
+
 # Google Sheets
+# NOTE: Set GOOGLE_CREDS_JSON in Railway as a variable containing your full service account JSON string
 ENV GOOGLE_SHEET_NAME="Trading Log" \
-    GOOGLE_CREDS_JSON=""  # paste service account JSON here or set as Railway variable
-# Kraken (optional for now – establishes connectivity)
+    GOOGLE_CREDS_JSON=""
+
+# Kraken (optional)
 ENV KRAKEN_API_KEY="" \
     KRAKEN_API_SECRET=""
-# Behavior tuning
+
+# Runtime tuning
 ENV REFRESH_MINUTES=30 \
     BATCH_SIZE=50 \
     SLEEP_BETWEEN_BATCHES=5
 
+# Default command
 CMD ["python", "main.py"]
