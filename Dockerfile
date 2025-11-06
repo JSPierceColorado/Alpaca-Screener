@@ -35,10 +35,6 @@ ENV APCA_API_KEY_ID="" \
 ENV GOOGLE_SHEET_NAME="Trading Log" \
     GOOGLE_CREDS_JSON=""
 
-# Kraken (optional)
-ENV KRAKEN_API_KEY="" \
-    KRAKEN_API_SECRET=""
-
 # Runtime tuning
 ENV REFRESH_MINUTES=30 \
     BATCH_SIZE=50 \
