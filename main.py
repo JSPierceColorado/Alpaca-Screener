@@ -33,7 +33,7 @@ GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Trading Log")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
 
 # Throttling & batching
-APCA_MAX_RPM = int(os.environ.get("APCA_MAX_RPM", 120))        # pace Alpaca requests (req/min)
+APCA_MAX_RPM = int(os.environ.get("APCA_MAX_RPM", 120))        # requests/min cap to stay below Alpaca limit
 REQ_SLEEP = max(0.0, 60.0 / max(1, APCA_MAX_RPM))              # seconds to sleep per request
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 25))
 SLEEP_BETWEEN_BATCHES = float(os.environ.get("SLEEP_BETWEEN_BATCHES", 0.5))
@@ -41,7 +41,8 @@ SLEEP_BETWEEN_BATCHES = float(os.environ.get("SLEEP_BETWEEN_BATCHES", 0.5))
 # Intraday requirements
 # 2 weeks of 15m bars = 14 * 24 * 4 = 1344
 MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 1344))
-REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "true").lower() == "true"
+# Default to false so you still get daily metrics even if 15m is incomplete
+REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "false").lower() == "true"
 
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
 TZ = pytz.UTC
@@ -56,7 +57,7 @@ SCREENER_COLUMNS = [
 ]
 SCREENER_LAST_COL = "M"  # A..M
 
-# Exchanges to include (you said you want all of these)
+# Exchanges to include
 ALLOWED_EXCHANGES = {"NYSE", "NASDAQ", "ARCA", "BATS", "NYSEARCA"}
 
 # -------------------------
@@ -165,7 +166,7 @@ def _bars_request(symbols: List[str], tf: TimeFrame, start: datetime, end: datet
         timeframe=tf,
         start=start,
         end=end,
-        feed=DataFeed.IEX,  # IEX only per your directive
+        feed=DataFeed.IEX,  # IEX only (SIP disabled per your preference)
         page_token=page_token
     )
     resp = stock_data_client.get_stock_bars(req)  # BarsResponse
@@ -182,16 +183,18 @@ def fetch_bars_batch_paginated(symbols: List[str], tf: TimeFrame, start: datetim
     """Fetch all pages for (symbols, timeframe, start-end)."""
     all_frames = []
     token = None
+    page = 0
     while True:
+        page += 1
         try:
             df, token = _bars_request(symbols, tf, start, end, token)
+            if page % 5 == 0:
+                print(f"  - fetched page {page} for {tf} with {0 if df is None else len(df)} rows")
             pace_request()
         except Exception as e:
             msg = str(e).lower()
-            # Treat transient errors as retryable
             if any(m in msg for m in ["timeout", "temporarily", "rate limit", "429", "connection reset", "502", "503", "504"]):
                 raise TransientDataError(msg)
-            # Otherwise propagate
             raise
         if df is not None and not df.empty:
             all_frames.append(df)
@@ -199,7 +202,13 @@ def fetch_bars_batch_paginated(symbols: List[str], tf: TimeFrame, start: datetim
             break
     if not all_frames:
         return pd.DataFrame()
-    return pd.concat(all_frames).sort_index()
+    out = pd.concat(all_frames)
+    # Ensure sorted multiindex (symbol, timestamp) if present
+    try:
+        out = out.sort_index()
+    except Exception:
+        pass
+    return out
 
 def slice_symbol_df(df: Optional[pd.DataFrame], symbol: str) -> Optional[pd.DataFrame]:
     if df is None or df.empty:
@@ -214,15 +223,15 @@ def slice_symbol_df(df: Optional[pd.DataFrame], symbol: str) -> Optional[pd.Data
     return sdf.sort_index() if sdf is not None and not sdf.empty else None
 
 # -------------------------
-# Per-symbol computation (require full data if configured)
+# Per-symbol computation (daily always; 15m if available)
 # -------------------------
 def compute_row(symbol: str, df_15_batch: Optional[pd.DataFrame], df_1d_batch: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, pd.Series]]:
-    # Daily metrics
+    # Daily metrics (attempt always)
     s1d = slice_symbol_df(df_1d_batch, symbol)
     if s1d is None or s1d.empty:
         if REQUIRE_FULL_DATA:
             return None
-        # else: allow intraday-only symbols (rare), but keep going
+        # else, we can still include intraday-only (rare); keep going
 
     pl_1d = pl_7d = pl_14d = pct_down_ath = np.nan
     if s1d is not None and not s1d.empty:
@@ -245,7 +254,6 @@ def compute_row(symbol: str, df_15_batch: Optional[pd.DataFrame], df_1d_batch: O
     if s15 is None or len(s15) < MIN_15M_BARS:
         if REQUIRE_FULL_DATA:
             return None
-        # else: allow daily-only row with blank intraday fields
         rsi14 = ma60_last = ma240_last = macd_last = macd_signal_last = vol_24h = np.nan
         spark_series = pd.Series(dtype=float)
     else:
@@ -277,17 +285,10 @@ def compute_row(symbol: str, df_15_batch: Optional[pd.DataFrame], df_1d_batch: O
         "MACD_15m": round(macd_last, 6) if not math.isnan(macd_last) else "",
         "MACDsig_15m": round(macd_signal_last, 6) if not math.isnan(macd_signal_last) else "",
     }
-
-    # If we require full data and any of the daily metrics are missing, drop it
-    if REQUIRE_FULL_DATA:
-        needs = ["%down_from_ATH", "PL%_1d", "PL%_7d", "PL%_14d", "RSI14_15m", "MA60_15m", "MA240_15m", "MACD_15m", "MACDsig_15m"]
-        if any(row[k] == "" for k in needs) or spark_series is None or len(spark_series) < (14*24*4):
-            return None
-
     return row, spark_series
 
 # -------------------------
-# Sheets writing (A–M only; formulas parsed)
+# Sheets writing (A–M only; formulas parsed; corrected call order)
 # -------------------------
 def write_chartdata(ws_chart: gspread.Worksheet, all_spark: Dict[str, pd.Series]):
     # Full rewrite is fine – this sheet is bot-owned
@@ -298,13 +299,13 @@ def write_chartdata(ws_chart: gspread.Worksheet, all_spark: Dict[str, pd.Series]
     for sym, series in all_spark.items():
         row = [sym] + (list(map(lambda x: float(x) if pd.notna(x) else "", series.values)) if series is not None else [])
         values.append(row)
-    ws_chart.clear()
-    ws_chart.update('A1', values, raw=False)
+    # New signature: values first, then range_name (or named args)
+    ws_chart.update(values, 'A1', raw=False)
 
 def write_screener_partial(ws_main: gspread.Worksheet, rows: List[Dict]):
     # Build A..M only; do not clear the whole sheet; leave N+ untouched
     header = [c for c in SCREENER_COLUMNS]
-    ws_main.update(f"A1:{SCREENER_LAST_COL}1", [header], raw=False)
+    ws_main.update([header], f"A1:{SCREENER_LAST_COL}1", raw=False)
 
     out = []
     for i, r in enumerate(rows, start=2):
@@ -314,7 +315,7 @@ def write_screener_partial(ws_main: gspread.Worksheet, rows: List[Dict]):
         out.append(base)
 
     if out:
-        ws_main.update(f"A2:{SCREENER_LAST_COL}{len(out)+1}", out, raw=False)
+        ws_main.update(out, f"A2:{SCREENER_LAST_COL}{len(out)+1}", raw=False)
 
 # -------------------------
 # Orchestration
@@ -327,7 +328,7 @@ def run_once():
 
     assets = list_alpaca_tradable_equities()
     symbols = [a["symbol"] for a in assets]
-    print(f"Symbols after exchange filter: {len(symbols)}")
+    print(f"[INFO] Symbols after exchange filter: {len(symbols)}")
 
     rows: List[Dict] = []
     spark_map: Dict[str, pd.Series] = {}
@@ -337,9 +338,12 @@ def run_once():
     start_15m = end - timedelta(days=14, minutes=5)
     start_1d = end - timedelta(days=365*5)
 
+    kept = 0
+    dropped = 0
+
     for i in range(0, len(symbols), BATCH_SIZE):
         batch_syms = symbols[i:i+BATCH_SIZE]
-        print(f"Batch {i//BATCH_SIZE + 1}: fetching bars for {len(batch_syms)} symbols…")
+        print(f"[INFO] Batch {i//BATCH_SIZE + 1}: fetching bars for {len(batch_syms)} symbols…")
 
         df_15 = pd.DataFrame()
         df_1d = pd.DataFrame()
@@ -357,18 +361,25 @@ def run_once():
             try:
                 res = compute_row(sym, df_15, df_1d)
                 if res is None:
+                    dropped += 1
                     continue
                 row, spark = res
                 rows.append(row)
                 spark_map[sym] = spark
+                kept += 1
             except Exception as e:
                 print(f"[WARN] compute failed for {sym}: {e}")
+                dropped += 1
 
+        print(f"[INFO] Batch result: kept {kept}, dropped {dropped}")
         time.sleep(SLEEP_BETWEEN_BATCHES)
 
+    # Always write headers; write data if any
     rows.sort(key=lambda r: r.get('symbol', ''))
+    print(f"[INFO] Writing chart data for {len(spark_map)} symbols and screener rows: {len(rows)}")
     write_chartdata(ws_chart, spark_map)
     write_screener_partial(ws_main, rows)
+    print(f"[INFO] Write complete.")
 
 if __name__ == "__main__":
     print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, paginated, A–M only)…")
