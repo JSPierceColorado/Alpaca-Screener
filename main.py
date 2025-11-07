@@ -1,446 +1,435 @@
-import os
-import json
-import time
-import math
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Tuple, Optional
+#!/usr/bin/env python3
+import os, sys, json, time, math, random, logging
+from typing import List, Tuple, Dict
+from datetime import datetime, timezone, timedelta
 
-import numpy as np
-import pandas as pd
-import pytz
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-
-# Alpaca
-from alpaca.trading.client import TradingClient
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import Adjustment, DataFeed
-
-# Google Sheets
 import gspread
 from google.oauth2.service_account import Credentials
-
-# -------------------------
-# Env / Settings
-# -------------------------
-APCA_API_KEY_ID = os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_KEY_ID")
-APCA_API_SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
-APCA_API_BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-
-GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Trading Log")
-GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
-
-# Throttling & batching
-APCA_MAX_RPM = int(os.environ.get("APCA_MAX_RPM", 120))        # requests/min cap to stay below Alpaca limit
-REQ_SLEEP = max(0.0, 60.0 / max(1, APCA_MAX_RPM))              # seconds to sleep per request
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 25))
-SLEEP_BETWEEN_BATCHES = float(os.environ.get("SLEEP_BETWEEN_BATCHES", 0.5))
-
-# Intraday (15m) window
-LOOKBACK_DAYS_INTRADAY = int(os.environ.get("LOOKBACK_DAYS_INTRADAY", 14))
-# exactly 2 weeks of 15m bars = 14 * 24 * 4 = 1344
-MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 1344))
-# allow rows even if 15m is thin so daily metrics still write
-REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "false").lower() == "true"
-
-REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
-TZ = pytz.UTC
-
-SCREENER_TAB = "Alpaca-Screener"
-CHARTDATA_TAB = "Alpaca-Screener-chartData"
-
-# We own A–M (don’t touch N+)
-SCREENER_COLUMNS = [
-    "symbol", "class", "%down_from_ATH", "PL%_1d", "PL%_7d", "PL%_14d",
-    "volume_24h", "RSI14_15m", "MA60_15m", "MA240_15m", "MACD_15m", "MACDsig_15m", "sparkline"
-]
-SCREENER_LAST_COL = "M"  # A..M
-
-# Exchanges to include (you said you like all of these)
-ALLOWED_EXCHANGES = {"NYSE", "NASDAQ", "ARCA", "BATS", "NYSEARCA"}
-
-# Sampling controls
-MAX_SYMBOLS = os.environ.get("MAX_SYMBOLS")                 # e.g., "1000"
-SYMBOLS_OFFSET = int(os.environ.get("SYMBOLS_OFFSET", 0))   # e.g., 2000
-SHUFFLE_SYMBOLS = os.environ.get("SHUFFLE_SYMBOLS", "false").lower() == "true"
-SAMPLE_SEED = os.environ.get("SAMPLE_SEED")                 # e.g., "42"
-
-# -------------------------
-# Indicators
-# -------------------------
-def ema(series: pd.Series, span: int) -> pd.Series:
-    return series.ewm(span=span, adjust=False).mean()
-
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=series.index).ewm(alpha=1/period, adjust=False).mean()
-    roll_down = pd.Series(down, index=series.index).ewm(alpha=1/period, adjust=False).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    return 100 - (100 / (1 + rs))
-
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series]:
-    macd_line = ema(series, fast) - ema(series, slow)
-    signal_line = ema(macd_line, signal)
-    return macd_line, signal_line
-
-def utcnow():
-    return datetime.now(timezone.utc)
-
-# -------------------------
-# Clients
-# -------------------------
-trading_client = TradingClient(
-    APCA_API_KEY_ID, APCA_API_SECRET_KEY,
-    paper=APCA_API_BASE_URL.endswith("paper-api.alpaca.markets")
+from gspread_formatting import (
+    format_cell_ranges, CellFormat, NumberFormat, set_frozen
 )
-stock_data_client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
 
-# -------------------------
+# =========================
+# Config (per your request)
+# =========================
+APCA_API_KEY_ID     = os.getenv("APCA_API_KEY_ID", "")
+APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY", "")
+
+GOOGLE_CREDS_JSON   = os.getenv("GOOGLE_CREDS_JSON", "")
+GOOGLE_SHEET_NAME   = os.getenv("GOOGLE_SHEET_NAME", "Trading Log")
+MAX_SYMBOLS         = int(os.getenv("MAX_SYMBOLS", "1000"))
+
+# Optional tunables
+HTTP_TIMEOUT        = int(os.getenv("HTTP_TIMEOUT", "15"))
+APCA_API_BASE       = os.getenv("APCA_API_BASE", "https://api.alpaca.markets")        # Trading API
+APCA_DATA_BASE      = os.getenv("APCA_DATA_BASE", "https://data.alpaca.markets")      # Data API v2
+ALPACA_FEED         = os.getenv("ALPACA_FEED", "iex")                                  # "iex" or "sip"
+LOOKBACK_DAYS_1D    = int(os.getenv("LOOKBACK_DAYS_1D", "450"))                        # for ATH/returns/volume
+LOOKBACK_DAYS_15M   = int(os.getenv("LOOKBACK_DAYS_15M", "60"))                        # for 15m indicators
+SPARK_LEN           = int(os.getenv("SPARK_LEN", "100"))                               # # of 15m closes in sparkline
+
+ASSETS_WS           = os.getenv("ASSETS_WS", "assets")
+SPARK_WS            = os.getenv("SPARK_WS", "spark_data")
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+UA = {"User-Agent": "Mozilla/5.0 (compatible; AlpacaAssetsBot/1.0; +https://example.org/bot)"}
+
+# =========================
+# Logging
+# =========================
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+# =========================
+# HTTP session with retries
+# =========================
+_session = requests.Session()
+try:
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
+    retry = Retry(
+        total=4,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    _session.mount("https://", HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20))
+    _session.headers.update(UA)
+except Exception:
+    pass
+
+# simple per-host pacing
+_next_ok_at: Dict[str, float] = {}
+def _pace(url: str, base_delay=0.12):
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc
+    now = time.time()
+    wait_until = _next_ok_at.get(host, now)
+    if wait_until > now:
+        time.sleep(wait_until - now)
+    _next_ok_at[host] = time.time() + base_delay * random.uniform(0.9, 1.3)
+
+def _sleep_with_jitter(seconds: float):
+    time.sleep(min(seconds, 30.0) * random.uniform(0.85, 1.15))
+
+def fetch_json_with_retries(url: str, *, params=None, headers=None, timeout=HTTP_TIMEOUT,
+                            retries=4, backoff_base=0.7) -> Dict:
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            _pace(url)
+            r = _session.get(url, params=params, headers=headers or UA, timeout=timeout)
+            if r.status_code == 429:
+                ra = r.headers.get("Retry-After")
+                delay = float(ra) if ra else backoff_base * (2 ** attempt)
+                logging.info(f"429 at {url} — sleeping {delay:.2f}s")
+                _sleep_with_jitter(delay)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_exc = e
+            _sleep_with_jitter(backoff_base * (2 ** attempt))
+    raise last_exc
+
+# =========================
 # Sheets helpers
-# -------------------------
-def get_gspread_client():
+# =========================
+def get_client():
     if not GOOGLE_CREDS_JSON:
-        raise RuntimeError("GOOGLE_CREDS_JSON env var is empty. Provide service account JSON.")
+        logging.error("GOOGLE_CREDS_JSON env var is missing.")
+        sys.exit(1)
     info = json.loads(GOOGLE_CREDS_JSON)
-    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
-def open_or_create_sheet(gc) -> gspread.Spreadsheet:
-    try:
-        return gc.open(GOOGLE_SHEET_NAME)
-    except gspread.SpreadsheetNotFound:
-        return gc.create(GOOGLE_SHEET_NAME)
+def open_sheet(gc):
+    return gc.open(GOOGLE_SHEET_NAME)
 
-def ensure_worksheet(sh, title: str, rows: int = 100, cols: int = 50):
+def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 10):
     try:
         return sh.worksheet(title)
     except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
-# -------------------------
-# Asset list: all active, tradable us_equity on allowed exchanges (no crypto)
-# -------------------------
-def list_alpaca_tradable_equities() -> List[Dict]:
-    url = APCA_API_BASE_URL.rstrip('/') + "/v2/assets"
-    headers = {"APCA-API-KEY-ID": APCA_API_KEY_ID or "", "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY or ""}
+def _json_safe_cell(v):
+    if v is None:
+        return ""
     try:
-        resp = requests.get(url, headers=headers, timeout=60)
-        resp.raise_for_status()
-        assets = resp.json()
+        if isinstance(v, float):
+            if math.isnan(v) or math.isinf(v):
+                return ""
+            return v
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            return v
+        if hasattr(v, "__float__"):
+            f = float(v)
+            if math.isnan(f) or math.isinf(f):
+                return ""
+            return f
+    except Exception:
+        pass
+    return str(v)
+
+def _json_safe_rows(rows: List[List[object]]) -> List[List[object]]:
+    return [[_json_safe_cell(c) for c in row] for row in rows]
+
+def replace_sheet(ws, rows: List[List[object]], header: List[str]):
+    # Clear and write header + data
+    ws.batch_clear(["A:ZZ"])
+    ws.update("A1", [header], value_input_option="RAW")
+    if rows:
+        rows = _json_safe_rows(rows)
+        CHUNK = 1000
+        start_row = 2
+        for i in range(0, len(rows), CHUNK):
+            block = rows[i:i+CHUNK]
+            ws.update(f"A{start_row}", block, value_input_option="RAW")
+            start_row += len(block)
+    logging.info(f"Wrote {len(rows) if rows else 0} rows to '{ws.title}'.")
+
+# =========================
+# Indicators
+# =========================
+def sma(values: List[float], window: int) -> float:
+    if len(values) < window:
+        return float("nan")
+    return round(sum(values[-window:]) / window, 4)
+
+def rsi14(values: List[float]) -> float:
+    period = 14
+    if len(values) < period + 1:
+        return float("nan")
+    gains, losses = 0.0, 0.0
+    for i in range(-period, 0):
+        ch = values[i] - values[i-1]
+        if ch > 0:
+            gains += ch
+        else:
+            losses -= ch
+    if losses == 0:
+        return 100.0
+    rs = gains / losses
+    return round(100 - (100 / (1 + rs)), 2)
+
+def macd_last(values: List[float]) -> Tuple[float, float, float]:
+    """Standard MACD(12,26,9) over closes; returns (macd, signal, hist) for the last bar."""
+    if len(values) < 26 + 9:
+        return (float("nan"), float("nan"), float("nan"))
+    k12, k26 = 2/(12+1), 2/(26+1)
+    # seed EMAs with SMA
+    ema12 = sum(values[:12]) / 12
+    ema26 = sum(values[:26]) / 26
+    # advance ema12 across values[12:26]
+    for v in values[12:26]:
+        ema12 = v * k12 + ema12 * (1 - k12)
+    macd_series = []
+    for v in values[26:]:
+        ema12 = v * k12 + ema12 * (1 - k12)
+        ema26 = v * k26 + ema26 * (1 - k26)
+        macd_series.append(ema12 - ema26)
+    if len(macd_series) < 9:
+        return (float("nan"), float("nan"), float("nan"))
+    # signal EMA(9) over MACD series
+    k9 = 2/(9+1)
+    sig = sum(macd_series[:9]) / 9
+    for m in macd_series[9:]:
+        sig = m * k9 + sig * (1 - k9)
+    macd_val = macd_series[-1]
+    hist = macd_val - sig
+    return (round(macd_val, 4), round(sig, 4), round(hist, 4))
+
+# =========================
+# Alpaca helpers
+# =========================
+def _apca_enabled() -> bool:
+    return bool(APCA_API_KEY_ID and APCA_API_SECRET_KEY)
+
+def _apca_headers() -> Dict[str, str]:
+    return {
+        **UA,
+        "APCA-API-KEY-ID": APCA_API_KEY_ID,
+        "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+        "Accept": "application/json",
+    }
+
+def _iso_utc_days_ago(days: int) -> str:
+    dt = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+def get_apca_tradable_assets(limit: int = MAX_SYMBOLS) -> List[str]:
+    """
+    Pull all tradable, active US equities from Alpaca Trading API.
+    """
+    if not _apca_enabled():
+        logging.error("[APCA] API keys missing; cannot fetch assets.")
+        return []
+    url = f"{APCA_API_BASE}/v2/assets"
+    params = {"status": "active", "asset_class": "us_equity"}
+    try:
+        data = fetch_json_with_retries(url, params=params, headers=_apca_headers(), timeout=20)
+        syms = []
+        for a in data or []:
+            try:
+                if a.get("tradable", False):
+                    s = (a.get("symbol") or "").strip().upper()
+                    if 1 <= len(s) <= 12:
+                        syms.append(s)
+            except Exception:
+                continue
+        syms = sorted(set(syms))
+        if limit and len(syms) > limit:
+            syms = syms[:limit]
+        logging.info(f"[APCA] Tradable assets: {len(syms)} (cap={limit})")
+        return syms
     except Exception as e:
-        print(f"[ERROR] Failed to fetch assets via HTTP: {e}")
+        logging.warning(f"[APCA] Error fetching assets: {e}")
         return []
 
-    kept, seen = [], set()
-    for a in assets:
-        symbol = a.get("symbol")
-        if not symbol or symbol in seen:
-            continue
-        if (a.get("status") or "").lower() != "active":
-            continue
-        if not a.get("tradable", False):
-            continue
-        cls = (a.get("class") or a.get("asset_class") or "").lower()
-        if cls != "us_equity":
-            continue
-        exch = (a.get("exchange") or "").upper()
-        if exch not in ALLOWED_EXCHANGES:
-            continue
-        kept.append({"symbol": symbol})
-        seen.add(symbol)
-    print(f"[INFO] Eligible US equities on major exchanges: {len(kept)}")
-    return kept
-
-# -------------------------
-# Rate limit wrapper
-# -------------------------
-def pace_request():
-    if REQ_SLEEP > 0:
-        time.sleep(REQ_SLEEP)
-
-# -------------------------
-# Fetchers (daily batched; 15m per-symbol, start/end + split adjustment)
-# -------------------------
-class TransientDataError(Exception): pass
-
-def _bars_request_multi(symbols: List[str], tf: TimeFrame, start: datetime, end: datetime, page_token: Optional[str]) -> Tuple[pd.DataFrame, Optional[str]]:
-    req = StockBarsRequest(
-        symbol_or_symbols=symbols,
-        timeframe=tf,
-        start=start, end=end,
-        adjustment=Adjustment.SPLIT,
-        feed=DataFeed.IEX,
-        page_token=page_token
-    )
-    resp = stock_data_client.get_stock_bars(req)
-    df = getattr(resp, "df", None)
-    next_token = getattr(resp, "next_page_token", None)
-    return (df if df is not None else pd.DataFrame()), next_token
-
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=8),
-       retry=retry_if_exception_type(TransientDataError))
-def fetch_daily_batch(symbols: List[str], start: datetime, end: datetime) -> pd.DataFrame:
-    all_frames, token, page = [], None, 0
-    while True:
-        page += 1
-        try:
-            df, token = _bars_request_multi(symbols, TimeFrame.Day, start, end, token)
-            if page % 5 == 0:
-                print(f"[INFO] daily page {page} rows={0 if df is None else len(df)}")
-            pace_request()
-        except Exception as e:
-            msg = str(e).lower()
-            if any(m in msg for m in ["timeout","temporarily","rate limit","429","connection reset","502","503","504"]):
-                raise TransientDataError(msg)
-            raise
-        if df is not None and not df.empty:
-            all_frames.append(df)
-        if not token:
-            break
-    return pd.concat(all_frames).sort_index() if all_frames else pd.DataFrame()
-
-@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=8),
-       retry=retry_if_exception_type(TransientDataError))
-def fetch_15m_one(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-    """Fetch 15m with start/end + split adjustment (IEX)."""
-    req = StockBarsRequest(
-        symbol_or_symbols=[symbol],
-        timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-        start=start, end=end,
-        adjustment=Adjustment.SPLIT,
-        feed=DataFeed.IEX
-    )
-    try:
-        resp = stock_data_client.get_stock_bars(req)
-        df = getattr(resp, "df", None)
-        if df is None or df.empty:
-            return pd.DataFrame()
-        # Flatten multi-index if present
-        if isinstance(df.index, pd.MultiIndex):
-            df = df.reset_index()
-        # Ensure required cols
-        cols = [c for c in ["timestamp", "close", "volume"] if c in df.columns]
-        df = df[cols].copy()
-        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
-        df = df.dropna(subset=["timestamp"]).sort_values("timestamp")
-        return df
-    except Exception as e:
-        msg = str(e).lower()
-        if any(m in msg for m in ["timeout","temporarily","rate limit","429","connection reset","502","503","504"]):
-            raise TransientDataError(msg)
-        return pd.DataFrame()
-    finally:
-        pace_request()
-
-def slice_symbol_df(df: Optional[pd.DataFrame], symbol: str) -> Optional[pd.DataFrame]:
-    if df is None or df.empty:
-        return None
-    if isinstance(df.index, pd.MultiIndex):
-        try:
-            sdf = df.xs(symbol, level='symbol')
-        except KeyError:
-            return None
-    else:
-        sdf = df[df.get('symbol','') == symbol] if 'symbol' in df.columns else df
-    return sdf.sort_index() if sdf is not None and not sdf.empty else None
-
-# -------------------------
-# Per-symbol computation (daily + 15m indicators)
-# -------------------------
-def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15m: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, pd.Series]]:
-    # Daily metrics
-    s1d = None
-    if df_1d_batch is not None and not df_1d_batch.empty:
-        if isinstance(df_1d_batch.index, pd.MultiIndex):
-            try:
-                s1d = df_1d_batch.xs(symbol, level='symbol').sort_index()
-            except KeyError:
-                s1d = None
-        else:
-            tmp = df_1d_batch[df_1d_batch.get('symbol','') == symbol]
-            s1d = tmp.sort_index() if not tmp.empty else None
-
-    pl_1d = pl_7d = pl_14d = pct_down_ath = np.nan
-    if s1d is not None and not s1d.empty:
-        last_close = s1d['close'].iloc[-1]
-        def pct_change_n_days(n):
-            cutoff = s1d.index.max() - pd.Timedelta(days=n)
-            prior = s1d[s1d.index <= cutoff]
-            if prior.empty: return np.nan
-            ref = prior['close'].iloc[-1]
-            return float(((last_close - ref) / ref) * 100.0) if ref else np.nan
-        pl_1d  = pct_change_n_days(1)
-        pl_7d  = pct_change_n_days(7)
-        pl_14d = pct_change_n_days(14)
-        ath = float(s1d['close'].max())
-        if ath > 0:
-            pct_down_ath = float(((last_close - ath) / ath) * 100.0)
-
-    # 15m indicators
-    rsi14 = ma60_last = ma240_last = macd_last = macd_signal_last = vol_24h = np.nan
-    spark_series = pd.Series(dtype=float)
-    if df_15m is not None and not df_15m.empty:
-        closes = df_15m['close']
-        vols = df_15m['volume'] if 'volume' in df_15m.columns else pd.Series(index=df_15m.index, data=np.nan)
-        if len(closes) >= MIN_15M_BARS:
-            rsi14_series = rsi(closes, 14)
-            ma60 = closes.rolling(window=60, min_periods=1).mean()    # MA60 @ 15m
-            ma240 = closes.rolling(window=240, min_periods=1).mean()  # MA240 @ 15m
-            macd_line, signal_line = macd(closes)
-            rsi14 = float(rsi14_series.iloc[-1]) if len(rsi14_series) else np.nan
-            ma60_last = float(ma60.iloc[-1]) if len(ma60) else np.nan
-            ma240_last = float(ma240.iloc[-1]) if len(ma240) else np.nan
-            macd_last = float(macd_line.iloc[-1]) if len(macd_line) else np.nan
-            macd_signal_last = float(signal_line.iloc[-1]) if len(signal_line) else np.nan
-            vol_24h = float(vols.tail(96).sum(skipna=True)) if len(vols) else np.nan
-            spark_series = closes.tail(14 * 24 * 4)  # 1344 points
-
-    if REQUIRE_FULL_DATA:
-        need_daily = [pct_down_ath, pl_1d, pl_7d, pl_14d]
-        need_15m = [rsi14, ma60_last, ma240_last, macd_last, macd_signal_last]
-        if any(math.isnan(x) for x in need_daily) or any(math.isnan(x) for x in need_15m) or len(spark_series) < (14*24*4):
-            return None
-
-    row = {
-        "symbol": symbol,
-        "class": "us_equity",
-        "%down_from_ATH": round(pct_down_ath, 4) if not math.isnan(pct_down_ath) else "",
-        "PL%_1d": round(pl_1d, 4) if not math.isnan(pl_1d) else "",
-        "PL%_7d": round(pl_7d, 4) if not math.isnan(pl_7d) else "",
-        "PL%_14d": round(pl_14d, 4) if not math.isnan(pl_14d) else "",
-        "volume_24h": round(vol_24h, 4) if not math.isnan(vol_24h) else "",
-        "RSI14_15m": round(rsi14, 4) if not math.isnan(rsi14) else "",
-        "MA60_15m": round(ma60_last, 6) if not math.isnan(ma60_last) else "",
-        "MA240_15m": round(ma240_last, 6) if not math.isnan(ma240_last) else "",
-        "MACD_15m": round(macd_last, 6) if not math.isnan(macd_last) else "",
-        "MACDsig_15m": round(macd_signal_last, 6) if not math.isnan(macd_signal_last) else "",
+def get_bars(symbol: str, timeframe: str, start_iso: str, limit: int = 5000) -> List[Dict]:
+    """
+    Generic bars fetcher from Data API v2. Returns list of bars (dicts with c,h,l,o,v,t).
+    timeframe examples: '1Day', '15Min'
+    """
+    url = f"{APCA_DATA_BASE}/v2/stocks/{symbol}/bars"
+    params = {
+        "timeframe": timeframe,
+        "adjustment": "raw",
+        "feed": ALPACA_FEED,
+        "start": start_iso,
+        "limit": str(limit),
     }
-    return row, spark_series
+    try:
+        data = fetch_json_with_retries(url, params=params, headers=_apca_headers(), timeout=20)
+        return data.get("bars", []) or []
+    except Exception as e:
+        logging.info(f"[APCA] {symbol} bars({timeframe}) error: {e}")
+        return []
 
-# -------------------------
-# Sheets writing (A–M only; formulas parsed)
-# -------------------------
-def write_chartdata(ws_chart: gspread.Worksheet, all_spark: Dict[str, pd.Series]):
-    header = ["symbol"]
-    max_len = max((len(s) for s in all_spark.values() if s is not None), default=0)
-    header += [f"p{i+1}" for i in range(max_len)]
-    values = [header]
-    for sym, series in all_spark.items():
-        row = [sym] + (list(map(lambda x: float(x) if pd.notna(x) else "", series.values)) if series is not None else [])
-        values.append(row)
-    ws_chart.update(values, 'A1', raw=False)
+# =========================
+# Metrics per asset
+# =========================
+def compute_asset_metrics(symbol: str) -> Tuple[list, list]:
+    """
+    Returns:
+      - metrics row for Assets sheet
+      - sparkline row for Spark Data sheet (symbol followed by recent 15m closes)
+    """
+    # --- Daily bars: ATH, returns, 24h volume (use last daily volume)
+    daily_bars = get_bars(symbol, "1Day", _iso_utc_days_ago(LOOKBACK_DAYS_1D), limit=2000)
+    d_close = [float(b.get("c")) for b in daily_bars if "c" in b]
+    d_high  = [float(b.get("h")) for b in daily_bars if "h" in b]
+    d_vol   = [float(b.get("v")) for b in daily_bars if "v" in b]
 
-def write_screener_partial(ws_main: gspread.Worksheet, rows: List[Dict]):
-    header = [c for c in SCREENER_COLUMNS]
-    ws_main.update([header], f"A1:{SCREENER_LAST_COL}1", raw=False)
-    out = []
-    for i, r in enumerate(rows, start=2):
-        base = [r.get(c, "") for c in SCREENER_COLUMNS[:-1]]  # without sparkline
-        formula = f"=IFERROR(SPARKLINE(INDEX('{CHARTDATA_TAB}'!B:ZZ, MATCH(A{i}, '{CHARTDATA_TAB}'!$A:$A, 0), 0)), \"\")"
-        base.append(formula)
-        out.append(base)
-    if out:
-        ws_main.update(out, f"A2:{SCREENER_LAST_COL}{len(out)+1}", raw=False)
+    last_price = float("nan")
+    down_from_ath_pct = float("nan")
+    r1 = r7 = r14 = float("nan")
+    vol_24h = float("nan")
 
-# -------------------------
-# Orchestration
-# -------------------------
-def run_once():
-    print(f"[BOOT] APCA_MAX_RPM={APCA_MAX_RPM} sleep/request={REQ_SLEEP:.3f}s, BATCH_SIZE={BATCH_SIZE}, "
-          f"SLEEP_BETWEEN_BATCHES={SLEEP_BETWEEN_BATCHES}, LOOKBACK_DAYS_INTRADAY={LOOKBACK_DAYS_INTRADAY}, "
-          f"MIN_15M_BARS={MIN_15M_BARS}, REQUIRE_FULL_DATA={REQUIRE_FULL_DATA}")
+    if d_close:
+        last_price = d_close[-1]
+        if d_high:
+            ath = max(d_high)
+            if ath > 0:
+                down_from_ath_pct = round((ath - last_price) / ath * 100.0, 4)
+        def pct(now: float, then: float) -> float:
+            return round((now / then - 1.0) * 100.0, 4) if then and then > 0 else float("nan")
+        if len(d_close) >= 2:  r1  = pct(last_price, d_close[-2])
+        if len(d_close) >= 8:  r7  = pct(last_price, d_close[-8])
+        if len(d_close) >= 15: r14 = pct(last_price, d_close[-15])
+        if d_vol:
+            vol_24h = d_vol[-1]
 
-    gc = get_gspread_client()
-    sh = open_or_create_sheet(gc)
-    ws_main = ensure_worksheet(sh, SCREENER_TAB, rows=5000, cols=200)
-    ws_chart = ensure_worksheet(sh, CHARTDATA_TAB, rows=5000, cols=2000)
+    # --- 15m bars: RSI14, MA60, MA240, MACD
+    m15_bars = get_bars(symbol, "15Min", _iso_utc_days_ago(LOOKBACK_DAYS_15M), limit=5000)
+    m15_close = [float(b.get("c")) for b in m15_bars if "c" in b]
 
-    assets = list_alpaca_tradable_equities()
-    symbols = [a["symbol"] for a in assets]
+    rsi = rsi14(m15_close) if len(m15_close) >= 15 else float("nan")
+    ma60 = sma(m15_close, 60) if len(m15_close) >= 60 else float("nan")
+    ma240 = sma(m15_close, 240) if len(m15_close) >= 240 else float("nan")
+    macd, macd_sig, macd_hist = macd_last(m15_close)
 
-    # Optional sampling
-    if SHUFFLE_SYMBOLS:
-        rng = np.random.default_rng(int(SAMPLE_SEED) if SAMPLE_SEED else None)
-        rng.shuffle(symbols)
-    if SYMBOLS_OFFSET:
-        symbols = symbols[SYMBOLS_OFFSET:]
-    if MAX_SYMBOLS:
+    # Sparkline series: last up to SPARK_LEN closes
+    spark_series = m15_close[-SPARK_LEN:] if m15_close else []
+
+    metrics_row = [
+        symbol,
+        last_price,
+        down_from_ath_pct,
+        r1, r7, r14,
+        vol_24h,
+        rsi, ma60, ma240,
+        macd, macd_sig, macd_hist,
+        ""  # placeholder for SPARKLINE formula
+    ]
+    spark_row = [symbol] + spark_series
+    return metrics_row, spark_row
+
+# =========================
+# Pipeline: write sheets
+# =========================
+def run_assets(gc):
+    if not _apca_enabled():
+        logging.error("[APCA] Disabled — set APCA_API_KEY_ID and APCA_API_SECRET_KEY.")
+        return
+
+    sh = open_sheet(gc)
+    ws_assets = ensure_worksheet(sh, ASSETS_WS, rows=MAX_SYMBOLS + 10, cols=20)
+    ws_spark  = ensure_worksheet(sh, SPARK_WS, rows=MAX_SYMBOLS + 10, cols=SPARK_LEN + 5)
+
+    # Universe
+    symbols = get_apca_tradable_assets(MAX_SYMBOLS)
+    if not symbols:
+        logging.info("[Assets] No symbols returned.")
+        return
+
+    assets_rows: List[List[object]] = []
+    spark_rows:  List[List[object]] = []
+
+    for i, s in enumerate(symbols, 1):
         try:
-            cap = int(MAX_SYMBOLS)
-            if cap > 0:
-                symbols = symbols[:cap]
-        except ValueError:
-            pass
-
-    print(f"[INFO] Symbols after filters + sampling: {len(symbols)}")
-
-    rows: List[Dict] = []
-    spark_map: Dict[str, pd.Series] = {}
-
-    end = utcnow()
-    start_1d = end - timedelta(days=365*5)
-    start_15m = end - timedelta(days=LOOKBACK_DAYS_INTRADAY)
-
-    kept = dropped_no_daily = dropped_no_15m = dropped_full_required = 0
-
-    for i in range(0, len(symbols), BATCH_SIZE):
-        batch_syms = symbols[i:i+BATCH_SIZE]
-        print(f"[INFO] Batch {i//BATCH_SIZE + 1}: daily for {len(batch_syms)}; 15m per-symbol …")
-
-        # Daily batch
-        df_1d = pd.DataFrame()
-        try:
-            df_1d = fetch_daily_batch(batch_syms, start_1d, end)
+            mrow, srow = compute_asset_metrics(s)
+            assets_rows.append(mrow)
+            spark_rows.append(srow)
         except Exception as e:
-            print(f"[WARN] 1D batch fetch failed: {e}")
+            logging.info(f"[Assets] {s} skipped: {e}")
+        if i % 50 == 0:
+            logging.info(f"[Assets] Processed {i}/{len(symbols)}")
 
-        # Per-symbol 15m + compute
-        for sym in batch_syms:
-            try:
-                df15 = fetch_15m_one(sym, start_15m, end)
-                res = compute_row(sym, df_1d, df15)
-                if res is None:
-                    has_daily = False
-                    if df_1d is not None and not df_1d.empty:
-                        try:
-                            has_daily = not (df_1d.xs(sym, level='symbol').empty if isinstance(df_1d.index, pd.MultiIndex)
-                                             else df_1d[df_1d.get('symbol','') == sym].empty)
-                        except Exception:
-                            has_daily = False
-                    has_15m = df15 is not None and len(df15) >= MIN_15M_BARS
-                    if not has_daily: dropped_no_daily += 1
-                    elif not has_15m: dropped_no_15m += 1
-                    else: dropped_full_required += 1
-                    continue
-                row, spark = res
-                rows.append(row)
-                spark_map[sym] = spark
-                kept += 1
-            except Exception as e:
-                print(f"[WARN] compute failed for {sym}: {e}")
+    # Spark Data header & write
+    spark_max_len = max((len(r) - 1) for r in spark_rows) if spark_rows else 0
+    spark_header = ["symbol"] + [f"c{i}" for i in range(1, spark_max_len + 1)]
+    replace_sheet(ws_spark, spark_rows, spark_header)
 
-        print(f"[INFO] Batch cumulative kept={kept} / dropped_no_daily={dropped_no_daily} "
-              f"/ dropped_no_15m={dropped_no_15m} / dropped_full_required={dropped_full_required}")
-        time.sleep(SLEEP_BETWEEN_BATCHES)
+    # Assets header
+    assets_header = [
+        "symbol",
+        "last_price",
+        "%_down_from_ATH",
+        "return_1d_%", "return_7d_%", "return_14d_%",
+        "vol_24h",
+        "RSI14_15m", "MA60_15m", "MA240_15m",
+        "MACD", "MACD_signal", "MACD_hist",
+        "sparkline"
+    ]
 
-    rows.sort(key=lambda r: r.get('symbol', ''))
-    print(f"[INFO] Writing chart data for {len(spark_map)} symbols; screener rows: {len(rows)}")
-    write_chartdata(ws_chart, spark_map)
-    write_screener_partial(ws_main, rows)
-    print(f"[INFO] Write complete.")
+    # Inject SPARKLINE formulas (col N)
+    # Uses MATCH on SPARK_WS col A to find the row, then OFFSET from B1 for width = spark_max_len
+    width = max(1, min(SPARK_LEN, spark_max_len))
+    spark_formula_tpl = (
+        f'=IFERROR(SPARKLINE(OFFSET({SPARK_WS}!$B$1, '
+        f'MATCH($A{{ROW}}, {SPARK_WS}!$A$2:$A, 0), 0, 1, {width})), "")'
+    )
+    for idx in range(len(assets_rows)):
+        rownum = idx + 2  # data starts at A2
+        assets_rows[idx][-1] = spark_formula_tpl.replace("{ROW}", str(rownum))
+
+    # Write Assets sheet
+    replace_sheet(ws_assets, assets_rows, assets_header)
+
+    # Formatting
+    try:
+        set_frozen(ws_assets, rows=1)
+        format_cell_ranges(ws_assets, [
+            ("B2:B", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.0000"))),  # last price
+            ("C2:C", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.0000"))),  # % down ATH
+            ("D2:F", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.0000"))),  # returns
+            ("G2:G", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0"))),       # volume
+            ("H2:M", CellFormat(numberFormat=NumberFormat(type="NUMBER", pattern="0.0000"))),  # indicators
+        ])
+        ws_assets.set_basic_filter()
+    except Exception:
+        pass
+
+    logging.info(f"[Assets] Wrote {len(assets_rows)} rows to '{ASSETS_WS}' and spark data to '{SPARK_WS}'.")
+
+# =========================
+# Main
+# =========================
+def main():
+    if not _apca_enabled():
+        logging.error("APCA_API_KEY_ID / APCA_API_SECRET_KEY are required.")
+        sys.exit(1)
+    if not GOOGLE_CREDS_JSON:
+        logging.error("GOOGLE_CREDS_JSON is required.")
+        sys.exit(1)
+
+    key_tail = APCA_API_KEY_ID[-4:] if APCA_API_KEY_ID else "----"
+    logging.info(f"[Alpaca] Using API key ending with: {key_tail}")
+    logging.info(f"[Alpaca] Data base: {APCA_DATA_BASE} | Feed: {ALPACA_FEED}")
+    logging.info(f"[Sheets] Writing to spreadsheet: {GOOGLE_SHEET_NAME}")
+
+    gc = get_client()
+    run_assets(gc)
+    print("Done: assets metrics + sparkline data")
 
 if __name__ == "__main__":
-    print("Starting Alpaca ➜ Sheets (IEX 15m, daily batched, A–M only, 2-week sparklines)…")
-    refresh_seconds = max(60, REFRESH_MINUTES * 60)
-    while True:
-        try:
-            run_once()
-        except Exception as e:
-            print(f"[ERROR] run_once failed: {e}")
-        print(f"Done. Sleeping for {REFRESH_MINUTES} minutes…")
-        time.sleep(refresh_seconds)
+    main()
