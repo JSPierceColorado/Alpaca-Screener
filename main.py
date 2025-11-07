@@ -40,10 +40,8 @@ SLEEP_BETWEEN_BATCHES = float(os.environ.get("SLEEP_BETWEEN_BATCHES", 0.5))
 
 # Intraday requirements
 # 2 weeks of 15m bars = 14 * 24 * 4 = 1344
-MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 600))  # tolerant default; set 1344 to require full two weeks
-
-# Daily-only rows are allowed (so you always get output even if 15m is thin)
-REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "false").lower() == "true"
+MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 1300))  # near-full two weeks
+REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "true").lower() == "true"
 
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
 TZ = pytz.UTC
@@ -89,6 +87,22 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
     macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
     return macd_line, signal_line
+
+# -------------------------
+# Quick symbol filter to avoid known-problem classes
+# -------------------------
+def is_symbol_eligible(sym: str) -> bool:
+    s = sym.upper()
+    # skip preferred/series (dots), rights/units/warrants/common suffix pitfall
+    if '.' in s or '-' in s or '/' in s:
+        return False
+    # common warrant/unit/right endings
+    if s.endswith('W') or s.endswith('WS') or s.endswith('U') or s.endswith('R'):
+        return False
+    # extremely short one-letter ADR oddities or two-letter foreign prefs tend to fail for 15m
+    if len(s) <= 1:
+        return False
+    return True
 
 # -------------------------
 # Clients
@@ -230,7 +244,6 @@ def fetch_15m_one(symbol: str, bars_needed: int = 1344) -> pd.DataFrame:
         df = getattr(resp, "df", None)
         if df is None or df.empty:
             return pd.DataFrame()
-        # If MultiIndex, slice; else filter
         if isinstance(df.index, pd.MultiIndex):
             try:
                 df = df.xs(symbol, level='symbol')
@@ -244,7 +257,6 @@ def fetch_15m_one(symbol: str, bars_needed: int = 1344) -> pd.DataFrame:
         msg = str(e).lower()
         if any(m in msg for m in ["timeout", "temporarily", "rate limit", "429", "connection reset", "502", "503", "504"]):
             raise TransientDataError(msg)
-        # Non-transient
         return pd.DataFrame()
     finally:
         pace_request()
@@ -259,13 +271,13 @@ def slice_symbol_df(df: Optional[pd.DataFrame], symbol: str) -> Optional[pd.Data
             return None
     else:
         sdf = df[df.get('symbol', '') == symbol] if 'symbol' in df.columns else df
-    return sdf.sort_index() if sdf is not None and not sdf.empty else None
+    return sdf.sort_index() if sdf is not None and not df.empty else None
 
 # -------------------------
 # Per-symbol computation
 # -------------------------
 def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15_one: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, pd.Series]]:
-    # Daily metrics (from batched daily)
+    # Daily metrics
     s1d = slice_symbol_df(df_1d_batch, symbol)
 
     pl_1d = pl_7d = pl_14d = pct_down_ath = np.nan
@@ -285,7 +297,7 @@ def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15_one: Opt
         if ath > 0:
             pct_down_ath = float(((last_close - ath) / ath) * 100.0)
 
-    # Intraday metrics (from per-symbol 15m)
+    # Intraday metrics
     rsi14 = ma60_last = ma240_last = macd_last = macd_signal_last = vol_24h = np.nan
     spark_series = pd.Series(dtype=float)
     if df_15_one is not None and not df_15_one.empty and len(df_15_one) >= MIN_15M_BARS:
@@ -303,7 +315,7 @@ def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15_one: Opt
         vol_24h = float(volumes_15.tail(96).sum(skipna=True)) if len(volumes_15) else np.nan
         spark_series = closes_15.tail(14 * 24 * 4)
 
-    # if requiring full, ensure both daily + intraday present
+    # Require full data?
     if REQUIRE_FULL_DATA:
         need_daily = [pct_down_ath, pl_1d, pl_7d, pl_14d]
         need_intraday = [rsi14, ma60_last, ma240_last, macd_last, macd_signal_last]
@@ -361,6 +373,7 @@ def run_once():
           f"SLEEP_BETWEEN_BATCHES={SLEEP_BETWEEN_BATCHES}, MIN_15M_BARS={MIN_15M_BARS}, "
           f"REQUIRE_FULL_DATA={REQUIRE_FULL_DATA}, SHUFFLE_SYMBOLS={SHUFFLE_SYMBOLS}, "
           f"SYMBOLS_OFFSET={SYMBOLS_OFFSET}, MAX_SYMBOLS={MAX_SYMBOLS}, SAMPLE_SEED={SAMPLE_SEED}")
+
     gc = get_gspread_client()
     sh = open_or_create_sheet(gc)
     ws_main = ensure_worksheet(sh, SCREENER_TAB, rows=5000, cols=200)
@@ -387,13 +400,22 @@ def run_once():
         except ValueError:
             pass
 
-    print(f"[INFO] Symbols after exchange filter + sampling: {len(symbols)}")
+    # NEW: filter out “not exactly stocks” that tend to fail intraday on IEX
+    pre_count = len(symbols)
+    symbols = [s for s in symbols if is_symbol_eligible(s)]
+    print(f"[INFO] Symbols after exchange filter + sampling: {pre_count} -> eligible: {len(symbols)}")
 
     rows: List[Dict] = []
     spark_map: Dict[str, pd.Series] = {}
 
     end = utcnow()
     start_1d = end - timedelta(days=365*5)
+
+    # Counters for diagnostics
+    kept = 0
+    dropped_no_daily = 0
+    dropped_no_15m = 0
+    dropped_full_required = 0
 
     for i in range(0, len(symbols), BATCH_SIZE):
         batch_syms = symbols[i:i+BATCH_SIZE]
@@ -410,12 +432,28 @@ def run_once():
         for sym in batch_syms:
             try:
                 df_15 = fetch_15m_one(sym, bars_needed=1344)
-                row, spark = compute_row(sym, df_1d, df_15)
+                res = compute_row(sym, df_1d, df_15)
+                if res is None:
+                    # figure out why for logging
+                    has_daily = slice_symbol_df(df_1d, sym) is not None and not slice_symbol_df(df_1d, sym).empty
+                    has_15m = df_15 is not None and len(df_15) >= MIN_15M_BARS
+                    if not has_daily:
+                        dropped_no_daily += 1
+                    elif not has_15m:
+                        dropped_no_15m += 1
+                    else:
+                        dropped_full_required += 1
+                    continue
+
+                row, spark = res
                 rows.append(row)
                 spark_map[sym] = spark
+                kept += 1
             except Exception as e:
                 print(f"[WARN] compute failed for {sym}: {e}")
 
+        print(f"[INFO] Batch cumulative kept={kept} / dropped_no_daily={dropped_no_daily} "
+              f"/ dropped_no_15m={dropped_no_15m} / dropped_full_required={dropped_full_required}")
         time.sleep(SLEEP_BETWEEN_BATCHES)
 
     rows.sort(key=lambda r: r.get('symbol', ''))
