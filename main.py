@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import os, sys, json, time, math, random, logging
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -29,7 +29,7 @@ LOOKBACK_DAYS_1D    = int(os.getenv("LOOKBACK_DAYS_1D", "450"))                 
 LOOKBACK_DAYS_15M   = int(os.getenv("LOOKBACK_DAYS_15M", "60"))                        # for 15m indicators
 SPARK_LEN           = int(os.getenv("SPARK_LEN", "100"))                               # # of 15m closes in sparkline
 
-ASSETS_WS           = os.getenv("ASSETS_WS", "assets")
+ASSETS_WS           = os.getenv("ASSETS_WS", "Alpaca-Scraper")  # <— renamed as requested
 SPARK_WS            = os.getenv("SPARK_WS", "spark_data")
 
 SCOPES = [
@@ -37,7 +37,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; AlpacaAssetsBot/1.0; +https://example.org/bot)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; AlpacaAssetsBot/1.1; +https://example.org/bot)"}
 
 # =========================
 # Logging
@@ -142,17 +142,17 @@ def _json_safe_cell(v):
 def _json_safe_rows(rows: List[List[object]]) -> List[List[object]]:
     return [[_json_safe_cell(c) for c in row] for row in rows]
 
-def replace_sheet(ws, rows: List[List[object]], header: List[str]):
+def replace_sheet(ws, rows: List[List[object]], header: List[str], *, value_input_option: str = "RAW"):
     # Clear and write header + data
     ws.batch_clear(["A:ZZ"])
-    ws.update("A1", [header], value_input_option="RAW")
+    ws.update("A1", [header], value_input_option=value_input_option)
     if rows:
         rows = _json_safe_rows(rows)
         CHUNK = 1000
         start_row = 2
         for i in range(0, len(rows), CHUNK):
             block = rows[i:i+CHUNK]
-            ws.update(f"A{start_row}", block, value_input_option="RAW")
+            ws.update(f"A{start_row}", block, value_input_option=value_input_option)
             start_row += len(block)
     logging.info(f"Wrote {len(rows) if rows else 0} rows to '{ws.title}'.")
 
@@ -277,11 +277,15 @@ def get_bars(symbol: str, timeframe: str, start_iso: str, limit: int = 5000) -> 
 # =========================
 # Metrics per asset
 # =========================
-def compute_asset_metrics(symbol: str) -> Tuple[list, list]:
+def _is_finite(x) -> bool:
+    return (x is not None) and (not (isinstance(x, float) and (math.isnan(x) or math.isinf(x))))
+
+def compute_asset_metrics(symbol: str) -> Optional[Tuple[list, list]]:
     """
     Returns:
       - metrics row for Assets sheet
       - sparkline row for Spark Data sheet (symbol followed by recent 15m closes)
+    Returns None if ANY required metric cannot be computed (strict completeness).
     """
     # --- Daily bars: ATH, returns, 24h volume (use last daily volume)
     daily_bars = get_bars(symbol, "1Day", _iso_utc_days_ago(LOOKBACK_DAYS_1D), limit=2000)
@@ -289,36 +293,49 @@ def compute_asset_metrics(symbol: str) -> Tuple[list, list]:
     d_high  = [float(b.get("h")) for b in daily_bars if "h" in b]
     d_vol   = [float(b.get("v")) for b in daily_bars if "v" in b]
 
-    last_price = float("nan")
-    down_from_ath_pct = float("nan")
-    r1 = r7 = r14 = float("nan")
-    vol_24h = float("nan")
+    if not d_close or not d_high or not d_vol:
+        return None  # missing core data
 
-    if d_close:
-        last_price = d_close[-1]
-        if d_high:
-            ath = max(d_high)
-            if ath > 0:
-                down_from_ath_pct = round((ath - last_price) / ath * 100.0, 4)
-        def pct(now: float, then: float) -> float:
-            return round((now / then - 1.0) * 100.0, 4) if then and then > 0 else float("nan")
-        if len(d_close) >= 2:  r1  = pct(last_price, d_close[-2])
-        if len(d_close) >= 8:  r7  = pct(last_price, d_close[-8])
-        if len(d_close) >= 15: r14 = pct(last_price, d_close[-15])
-        if d_vol:
-            vol_24h = d_vol[-1]
+    last_price = d_close[-1]
+    ath = max(d_high) if d_high else float("nan")
+    if not _is_finite(last_price) or not _is_finite(ath) or ath <= 0:
+        return None
+    down_from_ath_pct = round((ath - last_price) / ath * 100.0, 4)
 
-    # --- 15m bars: RSI14, MA60, MA240, MACD
+    def pct(now: float, then: float) -> float:
+        if then and then > 0:
+            return round((now / then - 1.0) * 100.0, 4)
+        return float("nan")
+
+    # Ensure we have enough closes for 1d/7d/14d
+    if len(d_close) < 15:
+        return None
+    r1  = pct(last_price, d_close[-2])
+    r7  = pct(last_price, d_close[-8])
+    r14 = pct(last_price, d_close[-15])
+    vol_24h = d_vol[-1]
+
+    # --- 15m bars: RSI14, MA60, MA240, MACD + spark
     m15_bars = get_bars(symbol, "15Min", _iso_utc_days_ago(LOOKBACK_DAYS_15M), limit=5000)
     m15_close = [float(b.get("c")) for b in m15_bars if "c" in b]
 
-    rsi = rsi14(m15_close) if len(m15_close) >= 15 else float("nan")
-    ma60 = sma(m15_close, 60) if len(m15_close) >= 60 else float("nan")
-    ma240 = sma(m15_close, 240) if len(m15_close) >= 240 else float("nan")
+    if len(m15_close) < 240:  # need enough for MA240 & MACD signal (strict)
+        return None
+
+    rsi = rsi14(m15_close)
+    ma60 = sma(m15_close, 60)
+    ma240 = sma(m15_close, 240)
     macd, macd_sig, macd_hist = macd_last(m15_close)
 
+    # Validate all required metrics
+    required = [last_price, down_from_ath_pct, r1, r7, r14, vol_24h, rsi, ma60, ma240, macd, macd_sig, macd_hist]
+    if not all(_is_finite(x) for x in required):
+        return None
+
     # Sparkline series: last up to SPARK_LEN closes
-    spark_series = m15_close[-SPARK_LEN:] if m15_close else []
+    spark_series = m15_close[-SPARK_LEN:]
+    if not spark_series:
+        return None
 
     metrics_row = [
         symbol,
@@ -331,7 +348,7 @@ def compute_asset_metrics(symbol: str) -> Tuple[list, list]:
         ""  # placeholder for SPARKLINE formula
     ]
     spark_row = [symbol] + spark_series
-    return metrics_row, spark_row
+    return (metrics_row, spark_row)
 
 # =========================
 # Pipeline: write sheets
@@ -356,7 +373,10 @@ def run_assets(gc):
 
     for i, s in enumerate(symbols, 1):
         try:
-            mrow, srow = compute_asset_metrics(s)
+            res = compute_asset_metrics(s)
+            if res is None:
+                continue  # strict: skip incomplete rows
+            mrow, srow = res
             assets_rows.append(mrow)
             spark_rows.append(srow)
         except Exception as e:
@@ -364,10 +384,10 @@ def run_assets(gc):
         if i % 50 == 0:
             logging.info(f"[Assets] Processed {i}/{len(symbols)}")
 
-    # Spark Data header & write
+    # Spark Data header & write (RAW ok)
     spark_max_len = max((len(r) - 1) for r in spark_rows) if spark_rows else 0
     spark_header = ["symbol"] + [f"c{i}" for i in range(1, spark_max_len + 1)]
-    replace_sheet(ws_spark, spark_rows, spark_header)
+    replace_sheet(ws_spark, spark_rows, spark_header, value_input_option="RAW")
 
     # Assets header
     assets_header = [
@@ -382,7 +402,6 @@ def run_assets(gc):
     ]
 
     # Inject SPARKLINE formulas (col N)
-    # Uses MATCH on SPARK_WS col A to find the row, then OFFSET from B1 for width = spark_max_len
     width = max(1, min(SPARK_LEN, spark_max_len))
     spark_formula_tpl = (
         f'=IFERROR(SPARKLINE(OFFSET({SPARK_WS}!$B$1, '
@@ -392,8 +411,8 @@ def run_assets(gc):
         rownum = idx + 2  # data starts at A2
         assets_rows[idx][-1] = spark_formula_tpl.replace("{ROW}", str(rownum))
 
-    # Write Assets sheet
-    replace_sheet(ws_assets, assets_rows, assets_header)
+    # IMPORTANT: USER_ENTERED so SPARKLINE formulas are evaluated
+    replace_sheet(ws_assets, assets_rows, assets_header, value_input_option="USER_ENTERED")
 
     # Formatting
     try:
@@ -409,7 +428,7 @@ def run_assets(gc):
     except Exception:
         pass
 
-    logging.info(f"[Assets] Wrote {len(assets_rows)} rows to '{ASSETS_WS}' and spark data to '{SPARK_WS}'.")
+    logging.info(f"[Assets] Wrote {len(assets_rows)} complete rows to '{ASSETS_WS}' and spark data to '{SPARK_WS}'.")
 
 # =========================
 # Main
