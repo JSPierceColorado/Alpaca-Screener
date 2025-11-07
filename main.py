@@ -32,15 +32,15 @@ APCA_API_BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpac
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Trading Log")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
 
-# Throttling & batching
-APCA_MAX_RPM = int(os.environ.get("APCA_MAX_RPM", 120))        # requests/min cap to stay below Alpaca limit
-REQ_SLEEP = max(0.0, 60.0 / max(1, APCA_MAX_RPM))              # seconds to sleep per request
+# Throttling & batching (pace requests to stay under limits)
+APCA_MAX_RPM = int(os.environ.get("APCA_MAX_RPM", 120))          # requests/min cap
+REQ_SLEEP = max(0.0, 60.0 / max(1, APCA_MAX_RPM))                # seconds between requests
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 25))
 SLEEP_BETWEEN_BATCHES = float(os.environ.get("SLEEP_BETWEEN_BATCHES", 0.5))
 
-# Intraday requirements
-# 2 weeks of 15m bars = 14 * 24 * 4 = 1344
-MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 1300))  # near-full two weeks
+# Intraday requirements (1-hour bars)
+# 2 weeks of 1h bars ≈ 14 * 24 = 336
+MIN_1H_BARS = int(os.environ.get("MIN_1H_BARS", 320))            # near-full two weeks
 REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "true").lower() == "true"
 
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
@@ -52,7 +52,7 @@ CHARTDATA_TAB = "Alpaca-Screener-chartData"
 # Our owned columns A–M (don’t touch N+)
 SCREENER_COLUMNS = [
     "symbol", "class", "%down_from_ATH", "PL%_1d", "PL%_7d", "PL%_14d",
-    "volume_24h", "RSI14_15m", "MA60_15m", "MA240_15m", "MACD_15m", "MACDsig_15m", "sparkline"
+    "volume_24h", "RSI14_1h", "MA15_1h", "MA60_1h", "MACD_1h", "MACDsig_1h", "sparkline"
 ]
 SCREENER_LAST_COL = "M"  # A..M
 
@@ -93,13 +93,10 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
 # -------------------------
 def is_symbol_eligible(sym: str) -> bool:
     s = sym.upper()
-    # skip preferred/series (dots), rights/units/warrants/common suffix pitfall
     if '.' in s or '-' in s or '/' in s:
         return False
-    # common warrant/unit/right endings
     if s.endswith('W') or s.endswith('WS') or s.endswith('U') or s.endswith('R'):
         return False
-    # extremely short one-letter ADR oddities or two-letter foreign prefs tend to fail for 15m
     if len(s) <= 1:
         return False
     return True
@@ -227,15 +224,15 @@ def fetch_daily_batch(symbols: List[str], start: datetime, end: datetime) -> pd.
     return out
 
 # -------------------------
-# Per-symbol 15m (IEX, limit-based)
+# Per-symbol 1h (IEX, limit-based for reliability)
 # -------------------------
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=8),
        retry=retry_if_exception_type(TransientDataError))
-def fetch_15m_one(symbol: str, bars_needed: int = 1344) -> pd.DataFrame:
-    """Fetch ~2 weeks of 15m bars for a single symbol via limit (more reliable on IEX)."""
+def fetch_1h_one(symbol: str, bars_needed: int = 336) -> pd.DataFrame:
+    """Fetch ~2 weeks of 1-hour bars for a single symbol via limit (reliable on IEX)."""
     req = StockBarsRequest(
         symbol_or_symbols=[symbol],
-        timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+        timeframe=TimeFrame(1, TimeFrameUnit.Hour),
         limit=bars_needed,
         feed=DataFeed.IEX
     )
@@ -271,12 +268,12 @@ def slice_symbol_df(df: Optional[pd.DataFrame], symbol: str) -> Optional[pd.Data
             return None
     else:
         sdf = df[df.get('symbol', '') == symbol] if 'symbol' in df.columns else df
-    return sdf.sort_index() if sdf is not None and not df.empty else None
+    return sdf.sort_index() if sdf is not None and not sdf.empty else None
 
 # -------------------------
-# Per-symbol computation
+# Per-symbol computation (daily + 1h intraday)
 # -------------------------
-def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15_one: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, pd.Series]]:
+def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_1h_one: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, pd.Series]]:
     # Daily metrics
     s1d = slice_symbol_df(df_1d_batch, symbol)
 
@@ -297,29 +294,31 @@ def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15_one: Opt
         if ath > 0:
             pct_down_ath = float(((last_close - ath) / ath) * 100.0)
 
-    # Intraday metrics
-    rsi14 = ma60_last = ma240_last = macd_last = macd_signal_last = vol_24h = np.nan
+    # 1-hour intraday metrics
+    rsi14 = ma15_last = ma60_last = macd_last = macd_signal_last = vol_24h = np.nan
     spark_series = pd.Series(dtype=float)
-    if df_15_one is not None and not df_15_one.empty and len(df_15_one) >= MIN_15M_BARS:
-        closes_15 = df_15_one['close']
-        volumes_15 = df_15_one['volume'] if 'volume' in df_15_one.columns else pd.Series(index=df_15_one.index, data=np.nan)
-        rsi14_series = rsi(closes_15, 14)
-        ma60 = closes_15.rolling(window=60, min_periods=1).mean()
-        ma240 = closes_15.rolling(window=240, min_periods=1).mean()
-        macd_line, signal_line = macd(closes_15)
+    if df_1h_one is not None and not df_1h_one.empty and len(df_1h_one) >= MIN_1H_BARS:
+        closes_1h = df_1h_one['close']
+        volumes_1h = df_1h_one['volume'] if 'volume' in df_1h_one.columns else pd.Series(index=df_1h_one.index, data=np.nan)
+        rsi14_series = rsi(closes_1h, 14)
+        ma15 = closes_1h.rolling(window=15, min_periods=1).mean()   # MA15 @ 1h
+        ma60 = closes_1h.rolling(window=60, min_periods=1).mean()   # MA60 @ 1h
+        macd_line, signal_line = macd(closes_1h)
         rsi14 = float(rsi14_series.iloc[-1]) if len(rsi14_series) else np.nan
+        ma15_last = float(ma15.iloc[-1]) if len(ma15) else np.nan
         ma60_last = float(ma60.iloc[-1]) if len(ma60) else np.nan
-        ma240_last = float(ma240.iloc[-1]) if len(ma240) else np.nan
         macd_last = float(macd_line.iloc[-1]) if len(macd_line) else np.nan
         macd_signal_last = float(signal_line.iloc[-1]) if len(signal_line) else np.nan
-        vol_24h = float(volumes_15.tail(96).sum(skipna=True)) if len(volumes_15) else np.nan
-        spark_series = closes_15.tail(14 * 24 * 4)
+        # last 24 hours of 1h volume
+        vol_24h = float(volumes_1h.tail(24).sum(skipna=True)) if len(volumes_1h) else np.nan
+        # sparkline series = last 2 weeks of 1h closes (≈336 values)
+        spark_series = closes_1h.tail(14 * 24)
 
-    # Require full data?
+    # If requiring full data, ensure daily + 1h present fully
     if REQUIRE_FULL_DATA:
         need_daily = [pct_down_ath, pl_1d, pl_7d, pl_14d]
-        need_intraday = [rsi14, ma60_last, ma240_last, macd_last, macd_signal_last]
-        if any(math.isnan(x) for x in need_daily) or any(math.isnan(x) for x in need_intraday) or len(spark_series) < (14*24*4):
+        need_intraday = [rsi14, ma15_last, ma60_last, macd_last, macd_signal_last]
+        if any(math.isnan(x) for x in need_daily) or any(math.isnan(x) for x in need_intraday) or len(spark_series) < (14*24):
             return None
 
     row = {
@@ -330,11 +329,11 @@ def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15_one: Opt
         "PL%_7d": round(pl_7d, 4) if not math.isnan(pl_7d) else "",
         "PL%_14d": round(pl_14d, 4) if not math.isnan(pl_14d) else "",
         "volume_24h": round(vol_24h, 4) if not math.isnan(vol_24h) else "",
-        "RSI14_15m": round(rsi14, 4) if not math.isnan(rsi14) else "",
-        "MA60_15m": round(ma60_last, 6) if not math.isnan(ma60_last) else "",
-        "MA240_15m": round(ma240_last, 6) if not math.isnan(ma240_last) else "",
-        "MACD_15m": round(macd_last, 6) if not math.isnan(macd_last) else "",
-        "MACDsig_15m": round(macd_signal_last, 6) if not math.isnan(macd_signal_last) else "",
+        "RSI14_1h": round(rsi14, 4) if not math.isnan(rsi14) else "",
+        "MA15_1h": round(ma15_last, 6) if not math.isnan(ma15_last) else "",
+        "MA60_1h": round(ma60_last, 6) if not math.isnan(ma60_last) else "",
+        "MACD_1h": round(macd_last, 6) if not math.isnan(macd_last) else "",
+        "MACDsig_1h": round(macd_signal_last, 6) if not math.isnan(macd_signal_last) else "",
     }
     return row, spark_series
 
@@ -370,7 +369,7 @@ def write_screener_partial(ws_main: gspread.Worksheet, rows: List[Dict]):
 # -------------------------
 def run_once():
     print(f"[BOOT] APCA_MAX_RPM={APCA_MAX_RPM} (sleep/request {REQ_SLEEP:.3f}s), BATCH_SIZE={BATCH_SIZE}, "
-          f"SLEEP_BETWEEN_BATCHES={SLEEP_BETWEEN_BATCHES}, MIN_15M_BARS={MIN_15M_BARS}, "
+          f"SLEEP_BETWEEN_BATCHES={SLEEP_BETWEEN_BATCHES}, MIN_1H_BARS={MIN_1H_BARS}, "
           f"REQUIRE_FULL_DATA={REQUIRE_FULL_DATA}, SHUFFLE_SYMBOLS={SHUFFLE_SYMBOLS}, "
           f"SYMBOLS_OFFSET={SYMBOLS_OFFSET}, MAX_SYMBOLS={MAX_SYMBOLS}, SAMPLE_SEED={SAMPLE_SEED}")
 
@@ -400,7 +399,6 @@ def run_once():
         except ValueError:
             pass
 
-    # NEW: filter out “not exactly stocks” that tend to fail intraday on IEX
     pre_count = len(symbols)
     symbols = [s for s in symbols if is_symbol_eligible(s)]
     print(f"[INFO] Symbols after exchange filter + sampling: {pre_count} -> eligible: {len(symbols)}")
@@ -411,15 +409,14 @@ def run_once():
     end = utcnow()
     start_1d = end - timedelta(days=365*5)
 
-    # Counters for diagnostics
     kept = 0
-    dropped_no_daily = 0
-    dropped_no_15m = 0
     dropped_full_required = 0
+    dropped_no_daily = 0
+    dropped_no_1h = 0
 
     for i in range(0, len(symbols), BATCH_SIZE):
         batch_syms = symbols[i:i+BATCH_SIZE]
-        print(f"[INFO] Batch {i//BATCH_SIZE + 1}: daily for {len(batch_syms)}; 15m per-symbol …")
+        print(f"[INFO] Batch {i//BATCH_SIZE + 1}: daily for {len(batch_syms)}; 1h per-symbol …")
 
         # Fetch daily for the whole batch (fast)
         df_1d = pd.DataFrame()
@@ -428,19 +425,19 @@ def run_once():
         except Exception as e:
             print(f"[WARN] 1D batch fetch failed: {e}")
 
-        # For each symbol, fetch 15m bars individually (reliable)
+        # Per-symbol 1h
         for sym in batch_syms:
             try:
-                df_15 = fetch_15m_one(sym, bars_needed=1344)
-                res = compute_row(sym, df_1d, df_15)
+                df_1h = fetch_1h_one(sym, bars_needed=336)
+                res = compute_row(sym, df_1d, df_1h)
                 if res is None:
-                    # figure out why for logging
+                    # reasons (diagnostic)
                     has_daily = slice_symbol_df(df_1d, sym) is not None and not slice_symbol_df(df_1d, sym).empty
-                    has_15m = df_15 is not None and len(df_15) >= MIN_15M_BARS
+                    has_1h = df_1h is not None and len(df_1h) >= MIN_1H_BARS
                     if not has_daily:
                         dropped_no_daily += 1
-                    elif not has_15m:
-                        dropped_no_15m += 1
+                    elif not has_1h:
+                        dropped_no_1h += 1
                     else:
                         dropped_full_required += 1
                     continue
@@ -453,7 +450,7 @@ def run_once():
                 print(f"[WARN] compute failed for {sym}: {e}")
 
         print(f"[INFO] Batch cumulative kept={kept} / dropped_no_daily={dropped_no_daily} "
-              f"/ dropped_no_15m={dropped_no_15m} / dropped_full_required={dropped_full_required}")
+              f"/ dropped_no_1h={dropped_no_1h} / dropped_full_required={dropped_full_required}")
         time.sleep(SLEEP_BETWEEN_BATCHES)
 
     rows.sort(key=lambda r: r.get('symbol', ''))
@@ -463,7 +460,7 @@ def run_once():
     print(f"[INFO] Write complete.")
 
 if __name__ == "__main__":
-    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, daily batched + 15m per-symbol, A–M only)…")
+    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, daily batched + 1h per-symbol, A–M only)…")
     refresh_seconds = max(60, REFRESH_MINUTES * 60)
     while True:
         try:
