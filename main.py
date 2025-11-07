@@ -60,6 +60,12 @@ SCREENER_LAST_COL = "M"  # A..M
 # Exchanges to include
 ALLOWED_EXCHANGES = {"NYSE", "NASDAQ", "ARCA", "BATS", "NYSEARCA"}
 
+# NEW: symbol sampling controls
+MAX_SYMBOLS = os.environ.get("MAX_SYMBOLS")                 # e.g., "500"
+SYMBOLS_OFFSET = int(os.environ.get("SYMBOLS_OFFSET", 0))   # e.g., 2000
+SHUFFLE_SYMBOLS = os.environ.get("SHUFFLE_SYMBOLS", "false").lower() == "true"
+SAMPLE_SEED = os.environ.get("SAMPLE_SEED")                 # e.g., "42"
+
 # -------------------------
 # Utilities / Indicators
 # -------------------------
@@ -313,7 +319,8 @@ def write_screener_partial(ws_main: gspread.Worksheet, rows: List[Dict]):
 def run_once():
     print(f"[BOOT] APCA_MAX_RPM={APCA_MAX_RPM} (sleep/request {REQ_SLEEP:.3f}s), BATCH_SIZE={BATCH_SIZE}, "
           f"SLEEP_BETWEEN_BATCHES={SLEEP_BETWEEN_BATCHES}, MIN_15M_BARS={MIN_15M_BARS}, "
-          f"REQUIRE_FULL_DATA={REQUIRE_FULL_DATA}")
+          f"REQUIRE_FULL_DATA={REQUIRE_FULL_DATA}, SHUFFLE_SYMBOLS={SHUFFLE_SYMBOLS}, "
+          f"SYMBOLS_OFFSET={SYMBOLS_OFFSET}, MAX_SYMBOLS={MAX_SYMBOLS}, SAMPLE_SEED={SAMPLE_SEED}")
     gc = get_gspread_client()
     sh = open_or_create_sheet(gc)
     ws_main = ensure_worksheet(sh, SCREENER_TAB, rows=5000, cols=200)
@@ -321,7 +328,26 @@ def run_once():
 
     assets = list_alpaca_tradable_equities()
     symbols = [a["symbol"] for a in assets]
-    print(f"[INFO] Symbols after exchange filter: {len(symbols)}")
+
+    # Optional shuffle
+    if SHUFFLE_SYMBOLS:
+        rng = np.random.default_rng(int(SAMPLE_SEED) if SAMPLE_SEED else None)
+        rng.shuffle(symbols)
+
+    # Optional offset
+    if SYMBOLS_OFFSET:
+        symbols = symbols[SYMBOLS_OFFSET:]
+
+    # Optional cap
+    if MAX_SYMBOLS:
+        try:
+            cap = int(MAX_SYMBOLS)
+            if cap > 0:
+                symbols = symbols[:cap]
+        except ValueError:
+            pass
+
+    print(f"[INFO] Symbols after exchange filter + sampling: {len(symbols)}")
 
     rows: List[Dict] = []
     spark_map: Dict[str, pd.Series] = {}
@@ -366,7 +392,7 @@ def run_once():
     print(f"[INFO] Write complete.")
 
 if __name__ == "__main__":
-    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, paginated, A–M only, daily allowed)…")
+    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, paginated, A–M only, daily allowed, sampling)…")
     refresh_seconds = max(60, REFRESH_MINUTES * 60)
     while True:
         try:
