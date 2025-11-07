@@ -1,44 +1,60 @@
-# Use slim Python base
-FROM python:3.12-slim
+# ---- build stage (just to cache wheels) ----
+FROM python:3.12-slim AS builder
 
-# Prevent buffered stdout/stderr (helpful on Railway)
-ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    TZ=UTC
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# System deps
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# OS deps (certs, basic build tools for any wheels)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates tzdata \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --upgrade --no-cache-dir pip wheel \
+ && pip wheel --no-cache-dir -r requirements.txt -w /wheels
 
-# Copy dependency list first for better layer caching
-COPY requirements.txt ./
-RUN pip install -r requirements.txt
+# ---- runtime stage ----
+FROM python:3.12-slim
 
-# Copy project files
-COPY main.py ./
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-# -----------------------------
-# Environment variable defaults
-# -----------------------------
+# Minimal OS deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata \
+ && rm -rf /var/lib/apt/lists/*
 
-# Alpaca (override with your real keys in Railway)
-ENV APCA_API_KEY_ID="" \
-    APCA_API_SECRET_KEY="" \
-    APCA_API_BASE_URL="https://paper-api.alpaca.markets" \
-    APCA_DATA_BASE_URL="https://data.alpaca.markets"
+# Non-root user
+RUN useradd -m appuser
+WORKDIR /app
 
-# Google Sheets
-# NOTE: Set GOOGLE_CREDS_JSON in Railway as a variable containing your full service account JSON string
-ENV GOOGLE_SHEET_NAME="Trading Log" \
-    GOOGLE_CREDS_JSON=""
+# Install wheels built in the builder stage
+COPY --from=builder /wheels /wheels
+COPY --from=builder /app/requirements.txt .
+RUN pip install --no-cache-dir /wheels/*
 
-# Runtime tuning
-ENV REFRESH_MINUTES=30 \
-    BATCH_SIZE=50 \
-    SLEEP_BETWEEN_BATCHES=5
+# App code
+# Name your script exactly like you saved it (e.g. main.py or app.py)
+COPY app.py ./app.py
 
-# Default command
-CMD ["python", "main.py"]
+# Useful defaults (override in your platform/compose)
+ENV \
+  APCA_API_KEY_ID="" \
+  APCA_API_SECRET_KEY="" \
+  GOOGLE_CREDS_JSON="" \
+  GOOGLE_SHEET_NAME="Trading Log" \
+  MAX_SYMBOLS="500" \
+  ALPACA_FEED="iex" \
+  LOOKBACK_DAYS_1D="450" \
+  LOOKBACK_DAYS_15M="60" \
+  SPARK_LEN="100" \
+  ASSETS_WS="assets" \
+  SPARK_WS="spark_data"
+
+# If your platform supports healthchecks, you can add a lightweight one later.
+
+USER appuser
+
+# Run it
+CMD ["python", "app.py"]
