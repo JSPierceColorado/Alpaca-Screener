@@ -32,16 +32,16 @@ APCA_API_BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpac
 GOOGLE_SHEET_NAME = os.environ.get("GOOGLE_SHEET_NAME", "Trading Log")
 GOOGLE_CREDS_JSON = os.environ.get("GOOGLE_CREDS_JSON", "")
 
-# Throttling & batching (pace requests to stay under limits)
+# Throttling & batching
 APCA_MAX_RPM = int(os.environ.get("APCA_MAX_RPM", 120))          # requests/min cap
 REQ_SLEEP = max(0.0, 60.0 / max(1, APCA_MAX_RPM))                # seconds between requests
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", 25))
 SLEEP_BETWEEN_BATCHES = float(os.environ.get("SLEEP_BETWEEN_BATCHES", 0.5))
 
-# Intraday requirements (1-hour bars)
+# Intraday (1-hour bars)
 # 2 weeks of 1h bars ≈ 14 * 24 = 336
 MIN_1H_BARS = int(os.environ.get("MIN_1H_BARS", 320))            # near-full two weeks
-REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "true").lower() == "true"
+REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "false").lower() == "true"  # default: allow daily-only rows
 
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
 TZ = pytz.UTC
@@ -89,17 +89,33 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
     return macd_line, signal_line
 
 # -------------------------
-# Quick symbol filter to avoid known-problem classes
+# Symbol class helpers
 # -------------------------
-def is_symbol_eligible(sym: str) -> bool:
+BAD_SUFFIXES = ("W", "WS", "U", "R")  # warrants, units, rights (coarse)
+BAD_NAME_KEYWORDS = (
+    "preferred", "warrant", "unit", "right", "note", "bond", "debenture", "depositary share", "perp"
+)
+ETF_NAME_KEYWORDS = (" etf", " index fund", "index etf", "exchange-traded fund")
+
+def is_symbol_common_stock(sym: str, name: str) -> bool:
     s = sym.upper()
-    if '.' in s or '-' in s or '/' in s:
+    if any(ch in s for ch in ('.', '-', '/')):  # series, preferred, units etc.
         return False
-    if s.endswith('W') or s.endswith('WS') or s.endswith('U') or s.endswith('R'):
+    if s.endswith(BAD_SUFFIXES):
         return False
-    if len(s) <= 1:
+    # Exclude by name clues
+    n = (name or "").lower()
+    if any(k in n for k in BAD_NAME_KEYWORDS):
         return False
     return True
+
+def is_symbol_etf(sym: str, name: str) -> bool:
+    n = (name or "").lower()
+    return any(k in n for k in ETF_NAME_KEYWORDS)
+
+def is_symbol_eligible(sym: str, name: str) -> bool:
+    # Allow common stocks or ETFs; exclude everything else.
+    return is_symbol_common_stock(sym, name) or is_symbol_etf(sym, name)
 
 # -------------------------
 # Clients
@@ -134,9 +150,9 @@ def ensure_worksheet(sh, title: str, rows: int = 100, cols: int = 50) -> gspread
         return sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
 
 # -------------------------
-# Assets list (REST; equities only, allowed exchanges)
+# Assets list (REST; equities only, allowed exchanges) → keep only stocks & ETFs
 # -------------------------
-def list_alpaca_tradable_equities() -> List[Dict]:
+def list_alpaca_tradable_stocks_and_etfs() -> List[Dict]:
     url = APCA_API_BASE_URL.rstrip('/') + "/v2/assets"
     headers = {"APCA-API-KEY-ID": APCA_API_KEY_ID or "", "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY or ""}
     try:
@@ -147,7 +163,7 @@ def list_alpaca_tradable_equities() -> List[Dict]:
         print(f"[ERROR] Failed to fetch assets via HTTP: {e}")
         return []
 
-    unique, seen = [], set()
+    kept, seen = [], set()
     for a in assets:
         symbol = a.get("symbol")
         if not symbol or symbol in seen:
@@ -162,9 +178,16 @@ def list_alpaca_tradable_equities() -> List[Dict]:
         exch = (a.get("exchange") or "").upper()
         if exch not in ALLOWED_EXCHANGES:
             continue
-        unique.append({"symbol": symbol})
+
+        name = a.get("name") or ""
+        if not is_symbol_eligible(symbol, name):
+            continue
+
+        kept.append({"symbol": symbol, "name": name})
         seen.add(symbol)
-    return unique
+
+    print(f"[INFO] Eligible stocks/ETFs after filters: {len(kept)}")
+    return kept
 
 # -------------------------
 # Rate-limited call wrapper
@@ -174,7 +197,7 @@ def pace_request():
         time.sleep(REQ_SLEEP)
 
 # -------------------------
-# Batched daily (IEX, time-range + pagination)
+# Data fetchers
 # -------------------------
 class TransientDataError(Exception): pass
 
@@ -223,13 +246,9 @@ def fetch_daily_batch(symbols: List[str], start: datetime, end: datetime) -> pd.
         pass
     return out
 
-# -------------------------
-# Per-symbol 1h (IEX, limit-based for reliability)
-# -------------------------
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=8),
        retry=retry_if_exception_type(TransientDataError))
 def fetch_1h_one(symbol: str, bars_needed: int = 336) -> pd.DataFrame:
-    """Fetch ~2 weeks of 1-hour bars for a single symbol via limit (reliable on IEX)."""
     req = StockBarsRequest(
         symbol_or_symbols=[symbol],
         timeframe=TimeFrame(1, TimeFrameUnit.Hour),
@@ -314,7 +333,7 @@ def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_1h_one: Opt
         # sparkline series = last 2 weeks of 1h closes (≈336 values)
         spark_series = closes_1h.tail(14 * 24)
 
-    # If requiring full data, ensure daily + 1h present fully
+    # Require full?
     if REQUIRE_FULL_DATA:
         need_daily = [pct_down_ath, pl_1d, pl_7d, pl_14d]
         need_intraday = [rsi14, ma15_last, ma60_last, macd_last, macd_signal_last]
@@ -338,7 +357,7 @@ def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_1h_one: Opt
     return row, spark_series
 
 # -------------------------
-# Sheets writing (A–M only; formulas parsed; correct call order)
+# Sheets writing (A–M only; formulas parsed)
 # -------------------------
 def write_chartdata(ws_chart: gspread.Worksheet, all_spark: Dict[str, pd.Series]):
     header = ["symbol"]
@@ -378,7 +397,7 @@ def run_once():
     ws_main = ensure_worksheet(sh, SCREENER_TAB, rows=5000, cols=200)
     ws_chart = ensure_worksheet(sh, CHARTDATA_TAB, rows=5000, cols=2000)
 
-    assets = list_alpaca_tradable_equities()
+    assets = list_alpaca_tradable_stocks_and_etfs()
     symbols = [a["symbol"] for a in assets]
 
     # Optional shuffle
@@ -399,9 +418,7 @@ def run_once():
         except ValueError:
             pass
 
-    pre_count = len(symbols)
-    symbols = [s for s in symbols if is_symbol_eligible(s)]
-    print(f"[INFO] Symbols after exchange filter + sampling: {pre_count} -> eligible: {len(symbols)}")
+    print(f"[INFO] Symbols after stock/ETF filter + sampling: {len(symbols)}")
 
     rows: List[Dict] = []
     spark_map: Dict[str, pd.Series] = {}
@@ -431,7 +448,6 @@ def run_once():
                 df_1h = fetch_1h_one(sym, bars_needed=336)
                 res = compute_row(sym, df_1d, df_1h)
                 if res is None:
-                    # reasons (diagnostic)
                     has_daily = slice_symbol_df(df_1d, sym) is not None and not slice_symbol_df(df_1d, sym).empty
                     has_1h = df_1h is not None and len(df_1h) >= MIN_1H_BARS
                     if not has_daily:
@@ -460,7 +476,7 @@ def run_once():
     print(f"[INFO] Write complete.")
 
 if __name__ == "__main__":
-    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, daily batched + 1h per-symbol, A–M only)…")
+    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, stocks+ETFs, daily batched + 1h per-symbol, A–M only)…")
     refresh_seconds = max(60, REFRESH_MINUTES * 60)
     while True:
         try:
