@@ -29,15 +29,15 @@ LOOKBACK_DAYS_1D    = int(os.getenv("LOOKBACK_DAYS_1D", "450"))                 
 LOOKBACK_DAYS_15M   = int(os.getenv("LOOKBACK_DAYS_15M", "60"))                        # for 15m indicators
 SPARK_LEN           = int(os.getenv("SPARK_LEN", "100"))                               # # of 15m closes in sparkline
 
-ASSETS_WS           = os.getenv("ASSETS_WS", "Alpaca-Scraper")  # <— renamed as requested
-SPARK_WS            = os.getenv("SPARK_WS", "spark_data")
+ASSETS_WS           = os.getenv("ASSETS_WS", "Alpaca-Scraper")  # target sheet name
+SPARK_WS            = os.getenv("SPARK_WS", "spark_data")       # sparkline backing data
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-UA = {"User-Agent": "Mozilla/5.0 (compatible; AlpacaAssetsBot/1.1; +https://example.org/bot)"}
+UA = {"User-Agent": "Mozilla/5.0 (compatible; AlpacaAssetsBot/1.2; +https://example.org/bot)"}
 
 # =========================
 # Logging
@@ -118,6 +118,28 @@ def ensure_worksheet(sh, title: str, rows: int = 1000, cols: int = 10):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
+def ensure_size(ws, min_rows: int, min_cols: int):
+    """Grow the worksheet if it's smaller than needed."""
+    try:
+        rows = getattr(ws, "row_count", None)
+        cols = getattr(ws, "col_count", None)
+        if rows is None or cols is None:
+            meta = ws.spreadsheet.fetch_sheet_metadata()
+            for sht in meta.get("sheets", []):
+                props = sht.get("properties", {})
+                if props.get("title") == ws.title:
+                    gp = props.get("gridProperties", {}) or {}
+                    rows = gp.get("rowCount", 1000)
+                    cols = gp.get("columnCount", 26)
+                    break
+        need_rows = max(int(rows or 0), int(min_rows))
+        need_cols = max(int(cols or 0), int(min_cols))
+        if need_rows > (rows or 0) or need_cols > (cols or 0):
+            ws.resize(rows=need_rows, cols=need_cols)
+    except Exception:
+        # If resizing fails, writes may error if truly too small
+        pass
+
 def _json_safe_cell(v):
     if v is None:
         return ""
@@ -143,17 +165,26 @@ def _json_safe_rows(rows: List[List[object]]) -> List[List[object]]:
     return [[_json_safe_cell(c) for c in row] for row in rows]
 
 def replace_sheet(ws, rows: List[List[object]], header: List[str], *, value_input_option: str = "RAW"):
+    # Determine required size (header + data) and ensure the grid is big enough
+    data_rows = len(rows) if rows else 0
+    data_cols = max(len(header), max((len(r) for r in rows), default=0))
+    ensure_size(ws, min_rows=data_rows + 2, min_cols=data_cols + 2)
+
     # Clear and write header + data
     ws.batch_clear(["A:ZZ"])
-    ws.update("A1", [header], value_input_option=value_input_option)
+
+    # New signature: values first, then range_name (or named args)
+    ws.update(values=[header], range_name="A1", value_input_option=value_input_option)
+
     if rows:
         rows = _json_safe_rows(rows)
         CHUNK = 1000
         start_row = 2
         for i in range(0, len(rows), CHUNK):
             block = rows[i:i+CHUNK]
-            ws.update(f"A{start_row}", block, value_input_option=value_input_option)
+            ws.update(values=block, range_name=f"A{start_row}", value_input_option=value_input_option)
             start_row += len(block)
+
     logging.info(f"Wrote {len(rows) if rows else 0} rows to '{ws.title}'.")
 
 # =========================
@@ -275,10 +306,10 @@ def get_bars(symbol: str, timeframe: str, start_iso: str, limit: int = 5000) -> 
         return []
 
 # =========================
-# Metrics per asset
+# Metrics per asset (strict completeness)
 # =========================
 def _is_finite(x) -> bool:
-    return (x is not None) and (not (isinstance(x, float) and (math.isnan(x) or math.isinf(x))))
+    return (x is not None) and not (isinstance(x, float) and (math.isnan(x) or math.isinf(x)))
 
 def compute_asset_metrics(symbol: str) -> Optional[Tuple[list, list]]:
     """
@@ -294,22 +325,23 @@ def compute_asset_metrics(symbol: str) -> Optional[Tuple[list, list]]:
     d_vol   = [float(b.get("v")) for b in daily_bars if "v" in b]
 
     if not d_close or not d_high or not d_vol:
-        return None  # missing core data
+        return None
 
     last_price = d_close[-1]
-    ath = max(d_high) if d_high else float("nan")
+    ath = max(d_high)
     if not _is_finite(last_price) or not _is_finite(ath) or ath <= 0:
         return None
     down_from_ath_pct = round((ath - last_price) / ath * 100.0, 4)
+
+    # returns vs N days ago close if available
+    if len(d_close) < 15:
+        return None
 
     def pct(now: float, then: float) -> float:
         if then and then > 0:
             return round((now / then - 1.0) * 100.0, 4)
         return float("nan")
 
-    # Ensure we have enough closes for 1d/7d/14d
-    if len(d_close) < 15:
-        return None
     r1  = pct(last_price, d_close[-2])
     r7  = pct(last_price, d_close[-8])
     r14 = pct(last_price, d_close[-15])
@@ -359,8 +391,9 @@ def run_assets(gc):
         return
 
     sh = open_sheet(gc)
-    ws_assets = ensure_worksheet(sh, ASSETS_WS, rows=MAX_SYMBOLS + 10, cols=20)
-    ws_spark  = ensure_worksheet(sh, SPARK_WS, rows=MAX_SYMBOLS + 10, cols=SPARK_LEN + 5)
+    # Create or open the sheets; exact size will be adjusted dynamically in replace_sheet()
+    ws_assets = ensure_worksheet(sh, ASSETS_WS)
+    ws_spark  = ensure_worksheet(sh, SPARK_WS)
 
     # Universe
     symbols = get_apca_tradable_assets(MAX_SYMBOLS)
@@ -411,7 +444,7 @@ def run_assets(gc):
         rownum = idx + 2  # data starts at A2
         assets_rows[idx][-1] = spark_formula_tpl.replace("{ROW}", str(rownum))
 
-    # IMPORTANT: USER_ENTERED so SPARKLINE formulas are evaluated
+    # USER_ENTERED so SPARKLINE formulas are evaluated
     replace_sheet(ws_assets, assets_rows, assets_header, value_input_option="USER_ENTERED")
 
     # Formatting
