@@ -40,9 +40,10 @@ SLEEP_BETWEEN_BATCHES = float(os.environ.get("SLEEP_BETWEEN_BATCHES", 0.5))
 
 # Intraday requirements
 # 2 weeks of 15m bars = 14 * 24 * 4 = 1344
-MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 1344))
-# Force allow daily-only rows so you always get output even if 15m is thin
-REQUIRE_FULL_DATA = False
+MIN_15M_BARS = int(os.environ.get("MIN_15M_BARS", 600))  # tolerant default; set 1344 to require full two weeks
+
+# Daily-only rows are allowed (so you always get output even if 15m is thin)
+REQUIRE_FULL_DATA = os.environ.get("REQUIRE_FULL_DATA", "false").lower() == "true"
 
 REFRESH_MINUTES = int(os.environ.get("REFRESH_MINUTES", 30))
 TZ = pytz.UTC
@@ -60,7 +61,7 @@ SCREENER_LAST_COL = "M"  # A..M
 # Exchanges to include
 ALLOWED_EXCHANGES = {"NYSE", "NASDAQ", "ARCA", "BATS", "NYSEARCA"}
 
-# NEW: symbol sampling controls
+# Symbol sampling controls
 MAX_SYMBOLS = os.environ.get("MAX_SYMBOLS")                 # e.g., "500"
 SYMBOLS_OFFSET = int(os.environ.get("SYMBOLS_OFFSET", 0))   # e.g., 2000
 SHUFFLE_SYMBOLS = os.environ.get("SHUFFLE_SYMBOLS", "false").lower() == "true"
@@ -162,40 +163,36 @@ def pace_request():
         time.sleep(REQ_SLEEP)
 
 # -------------------------
-# Batched, paginated data fetching (IEX only)
+# Batched daily (IEX, time-range + pagination)
 # -------------------------
 class TransientDataError(Exception): pass
 
-def _bars_request(symbols: List[str], tf: TimeFrame, start: datetime, end: datetime, page_token: Optional[str]) -> Tuple[pd.DataFrame, Optional[str]]:
+def _bars_request_multi(symbols: List[str], tf: TimeFrame, start: datetime, end: datetime, page_token: Optional[str]) -> Tuple[pd.DataFrame, Optional[str]]:
     req = StockBarsRequest(
         symbol_or_symbols=symbols,
         timeframe=tf,
         start=start,
         end=end,
-        feed=DataFeed.IEX,  # IEX only (SIP disabled)
+        feed=DataFeed.IEX,
         page_token=page_token
     )
-    resp = stock_data_client.get_stock_bars(req)  # BarsResponse
+    resp = stock_data_client.get_stock_bars(req)
     df = getattr(resp, "df", None)
     next_token = getattr(resp, "next_page_token", None)
     return (df if df is not None else pd.DataFrame()), next_token
 
-@retry(
-    stop=stop_after_attempt(2),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type(TransientDataError)
-)
-def fetch_bars_batch_paginated(symbols: List[str], tf: TimeFrame, start: datetime, end: datetime) -> pd.DataFrame:
-    """Fetch all pages for (symbols, timeframe, start-end)."""
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=8),
+       retry=retry_if_exception_type(TransientDataError))
+def fetch_daily_batch(symbols: List[str], start: datetime, end: datetime) -> pd.DataFrame:
     all_frames = []
     token = None
     page = 0
     while True:
         page += 1
         try:
-            df, token = _bars_request(symbols, tf, start, end, token)
+            df, token = _bars_request_multi(symbols, TimeFrame.Day, start, end, token)
             if page % 5 == 0:
-                print(f"[INFO]  fetched page {page} for {tf} with {0 if df is None else len(df)} rows")
+                print(f"[INFO]  daily page {page} rows={0 if df is None else len(df)}")
             pace_request()
         except Exception as e:
             msg = str(e).lower()
@@ -215,6 +212,43 @@ def fetch_bars_batch_paginated(symbols: List[str], tf: TimeFrame, start: datetim
         pass
     return out
 
+# -------------------------
+# Per-symbol 15m (IEX, limit-based)
+# -------------------------
+@retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=1, max=8),
+       retry=retry_if_exception_type(TransientDataError))
+def fetch_15m_one(symbol: str, bars_needed: int = 1344) -> pd.DataFrame:
+    """Fetch ~2 weeks of 15m bars for a single symbol via limit (more reliable on IEX)."""
+    req = StockBarsRequest(
+        symbol_or_symbols=[symbol],
+        timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+        limit=bars_needed,
+        feed=DataFeed.IEX
+    )
+    try:
+        resp = stock_data_client.get_stock_bars(req)
+        df = getattr(resp, "df", None)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        # If MultiIndex, slice; else filter
+        if isinstance(df.index, pd.MultiIndex):
+            try:
+                df = df.xs(symbol, level='symbol')
+            except KeyError:
+                return pd.DataFrame()
+        elif 'symbol' in df.columns:
+            df = df[df['symbol'] == symbol]
+        df = df.sort_index()
+        return df
+    except Exception as e:
+        msg = str(e).lower()
+        if any(m in msg for m in ["timeout", "temporarily", "rate limit", "429", "connection reset", "502", "503", "504"]):
+            raise TransientDataError(msg)
+        # Non-transient
+        return pd.DataFrame()
+    finally:
+        pace_request()
+
 def slice_symbol_df(df: Optional[pd.DataFrame], symbol: str) -> Optional[pd.DataFrame]:
     if df is None or df.empty:
         return None
@@ -228,14 +262,15 @@ def slice_symbol_df(df: Optional[pd.DataFrame], symbol: str) -> Optional[pd.Data
     return sdf.sort_index() if sdf is not None and not sdf.empty else None
 
 # -------------------------
-# Per-symbol computation (daily always; 15m if available)
+# Per-symbol computation
 # -------------------------
-def compute_row(symbol: str, df_15_batch: Optional[pd.DataFrame], df_1d_batch: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, pd.Series]]:
-    # Daily metrics
+def compute_row(symbol: str, df_1d_batch: Optional[pd.DataFrame], df_15_one: Optional[pd.DataFrame]) -> Optional[Tuple[Dict, pd.Series]]:
+    # Daily metrics (from batched daily)
     s1d = slice_symbol_df(df_1d_batch, symbol)
 
     pl_1d = pl_7d = pl_14d = pct_down_ath = np.nan
     if s1d is not None and not s1d.empty:
+        s1d = s1d.sort_index()
         last_close = s1d['close'].iloc[-1]
         def pct_change_n_days(n):
             cutoff = s1d.index.max() - pd.Timedelta(days=n)
@@ -250,13 +285,12 @@ def compute_row(symbol: str, df_15_batch: Optional[pd.DataFrame], df_1d_batch: O
         if ath > 0:
             pct_down_ath = float(((last_close - ath) / ath) * 100.0)
 
-    # Intraday metrics
-    s15 = slice_symbol_df(df_15_batch, symbol)
+    # Intraday metrics (from per-symbol 15m)
     rsi14 = ma60_last = ma240_last = macd_last = macd_signal_last = vol_24h = np.nan
     spark_series = pd.Series(dtype=float)
-    if s15 is not None and len(s15) >= MIN_15M_BARS:
-        closes_15 = s15['close']
-        volumes_15 = s15['volume'] if 'volume' in s15.columns else pd.Series(index=s15.index, data=np.nan)
+    if df_15_one is not None and not df_15_one.empty and len(df_15_one) >= MIN_15M_BARS:
+        closes_15 = df_15_one['close']
+        volumes_15 = df_15_one['volume'] if 'volume' in df_15_one.columns else pd.Series(index=df_15_one.index, data=np.nan)
         rsi14_series = rsi(closes_15, 14)
         ma60 = closes_15.rolling(window=60, min_periods=1).mean()
         ma240 = closes_15.rolling(window=240, min_periods=1).mean()
@@ -269,7 +303,13 @@ def compute_row(symbol: str, df_15_batch: Optional[pd.DataFrame], df_1d_batch: O
         vol_24h = float(volumes_15.tail(96).sum(skipna=True)) if len(volumes_15) else np.nan
         spark_series = closes_15.tail(14 * 24 * 4)
 
-    # Build row even if some fields are blank (we're not requiring full data)
+    # if requiring full, ensure both daily + intraday present
+    if REQUIRE_FULL_DATA:
+        need_daily = [pct_down_ath, pl_1d, pl_7d, pl_14d]
+        need_intraday = [rsi14, ma60_last, ma240_last, macd_last, macd_signal_last]
+        if any(math.isnan(x) for x in need_daily) or any(math.isnan(x) for x in need_intraday) or len(spark_series) < (14*24*4):
+            return None
+
     row = {
         "symbol": symbol,
         "class": "us_equity",
@@ -353,36 +393,29 @@ def run_once():
     spark_map: Dict[str, pd.Series] = {}
 
     end = utcnow()
-    start_15m = end - timedelta(days=14, minutes=5)
     start_1d = end - timedelta(days=365*5)
 
-    kept = 0
     for i in range(0, len(symbols), BATCH_SIZE):
         batch_syms = symbols[i:i+BATCH_SIZE]
-        print(f"[INFO] Batch {i//BATCH_SIZE + 1}: fetching bars for {len(batch_syms)} symbols…")
+        print(f"[INFO] Batch {i//BATCH_SIZE + 1}: daily for {len(batch_syms)}; 15m per-symbol …")
 
-        df_15 = pd.DataFrame()
+        # Fetch daily for the whole batch (fast)
         df_1d = pd.DataFrame()
         try:
-            df_15 = fetch_bars_batch_paginated(batch_syms, TimeFrame(15, TimeFrameUnit.Minute), start_15m, end)
-        except Exception as e:
-            print(f"[WARN] 15m batch fetch failed: {e}")
-
-        try:
-            df_1d = fetch_bars_batch_paginated(batch_syms, TimeFrame.Day, start_1d, end)
+            df_1d = fetch_daily_batch(batch_syms, start_1d, end)
         except Exception as e:
             print(f"[WARN] 1D batch fetch failed: {e}")
 
+        # For each symbol, fetch 15m bars individually (reliable)
         for sym in batch_syms:
             try:
-                row, spark = compute_row(sym, df_15, df_1d)
+                df_15 = fetch_15m_one(sym, bars_needed=1344)
+                row, spark = compute_row(sym, df_1d, df_15)
                 rows.append(row)
                 spark_map[sym] = spark
-                kept += 1
             except Exception as e:
                 print(f"[WARN] compute failed for {sym}: {e}")
 
-        print(f"[INFO] Batch cumulative kept: {kept}")
         time.sleep(SLEEP_BETWEEN_BATCHES)
 
     rows.sort(key=lambda r: r.get('symbol', ''))
@@ -392,7 +425,7 @@ def run_once():
     print(f"[INFO] Write complete.")
 
 if __name__ == "__main__":
-    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, paginated, A–M only, daily allowed, sampling)…")
+    print("Starting Alpaca ➜ Google Sheets screener loop (IEX-only, daily batched + 15m per-symbol, A–M only)…")
     refresh_seconds = max(60, REFRESH_MINUTES * 60)
     while True:
         try:
