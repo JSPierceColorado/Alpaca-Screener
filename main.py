@@ -170,8 +170,8 @@ def replace_sheet(ws, rows: List[List[object]], header: List[str], *, value_inpu
     data_cols = max(len(header), max((len(r) for r in rows), default=0))
     ensure_size(ws, min_rows=data_rows + 2, min_cols=data_cols + 2)
 
-    # Clear and write header + data
-    ws.batch_clear(["A:ZZ"])
+    # Clear and write header + data (only A–N, keep O+ untouched)
+    ws.batch_clear(["A:N"])
 
     # New signature: values first, then range_name (or named args)
     ws.update(values=[header], range_name="A1", value_input_option=value_input_option)
