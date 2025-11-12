@@ -29,7 +29,7 @@ LOOKBACK_DAYS_1D    = int(os.getenv("LOOKBACK_DAYS_1D", "450"))                 
 LOOKBACK_DAYS_15M   = int(os.getenv("LOOKBACK_DAYS_15M", "60"))                        # for 15m indicators
 SPARK_LEN           = int(os.getenv("SPARK_LEN", "100"))                               # # of 15m closes in sparkline
 
-ASSETS_WS           = os.getenv("ASSETS_WS", "Alpaca-Scraper")  # target sheet name
+ASSETS_WS           = os.getenv("ASSETS_WS", "Alpaca-Screener")  # target sheet name
 SPARK_WS            = os.getenv("SPARK_WS", "spark_data")       # sparkline backing data
 
 SCOPES = [
